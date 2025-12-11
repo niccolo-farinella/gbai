@@ -14,7 +14,7 @@ from collections import deque
 HOST = "127.0.0.1"
 PORT = 8765
 
-WORLD_JSON = "overworld-json/overworld_nav.json"
+WORLD_JSON = "overworld_nav.json"
 
 # Quanto tempo tenere premuto un tasto (in frame) lato emulatore
 DEFAULT_HOLD_FRAMES = 15
