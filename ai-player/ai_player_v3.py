@@ -9,31 +9,71 @@ import os
 from collections import deque
 import importlib.util
 from pathlib import Path
+import random
 
 # ================= CONFIG =================
 HOST = "127.0.0.1"
 PORT = 8765
 
-WORLD_FILE     = "overworld-json/overworld_nav.json"
-METADATA_FILE  = "overworld-json/overworld_metadata.json"
-SEMANTIC_FILE  = "overworld-semantic/semantic_locations.json"
+WORLD_FILE = "overworld-json/overworld_nav.json"
+METADATA_FILE = "overworld-json/overworld_metadata.json"
+SEMANTIC_FILE = "overworld-semantic/semantic_locations.json"
 
-# Path del README da iniettare come system prompt per il modello
+# Path del README (attualmente non usato direttamente nel prompt, ma lasciato per future estensioni)
 README_FILENAME = "readMe-ollama-rag-init.txt"
 
-# Endpoint Ollama locale
-# OLLAMA_URL   = "http://85.215.53.215:61434/api/generate"
-OLLAMA_URL   = "http://127.0.0.1:11434/api/generate"
-OLLAMA_MODEL = "llama3.2:3b-instruct-q8_0"
+# ---- LLM / Ollama ----
+
+LLM_MAX_ERRORS_BEFORE_BACKOFF = 3
+LLM_BACKOFF_SECONDS = 30.0
+
+
+def build_ollama_url() -> str:
+    """
+    Costruisce l'URL di Ollama usando, in ordine di priorità:
+    - OLLAMA_URL (env)
+    - OLLAMA_HOST (env)
+    - default locale http://127.0.0.1:11434/api/generate
+    """
+    env_url = os.getenv("OLLAMA_URL")
+    if env_url:
+        base = env_url.strip().rstrip("/")
+        if base.endswith("/api/generate"):
+            return base
+        if base.endswith("/api"):
+            return base + "/generate"
+        return base + "/api/generate"
+
+    env_host = os.getenv("OLLAMA_HOST")
+    if env_host:
+        host = env_host.strip()
+        if not host.startswith("http://") and not host.startswith("https://"):
+            host = "http://" + host
+        base = host.rstrip("/")
+        if base.endswith("/api/generate"):
+            return base
+        if base.endswith("/api"):
+            return base + "/generate"
+        return base + "/api/generate"
+
+    # fallback di default
+    return "http://127.0.0.1:11434/api/generate"
+
+
+OLLAMA_URL = build_ollama_url()
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:latest")
+
+# =========================================
+# Carichiamo World dinamicamente da backend-movement_v4.py
 # =========================================
 
-# Carichiamo World dinamicamente da backend-movement_v4.py senza richiedere rename
 BACKEND_PATH = Path(__file__).with_name("backend-movement_v4.py")
 spec = importlib.util.spec_from_file_location("backend_movement_v4", BACKEND_PATH)
 backend_mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(backend_mod)
-World = backend_mod.World
+World = backend_mod.World  # usiamo solo la parte di world / pathfinding
 
+# Mappature direzioni (World -> tasti bridge Lua)
 DIR_NAME_TO_KEY = {
     "up": "UP",
     "down": "DOWN",
@@ -41,18 +81,20 @@ DIR_NAME_TO_KEY = {
     "right": "RIGHT",
 }
 KEY_TO_DELTA = {
-    "UP":    (0, -1),
-    "DOWN":  (0,  1),
-    "LEFT":  (-1, 0),
-    "RIGHT": (1,  0),
+    "UP": (0, -1),
+    "DOWN": (0, 1),
+    "LEFT": (-1, 0),
+    "RIGHT": (1, 0),
 }
 
 
+# ================= NAVIGATOR (pathfinding alto livello) =================
+
 class Navigator:
-    '''
+    """
     Usa World (overworld_nav) per pianificare path cross-map e gestisce i blocchi dinamici
     (NPC in movimento, trainer che si spostano, ecc.).
-    '''
+    """
     def __init__(self, world: World):
         self.world = world
         # elementi: (map_name, x, y)
@@ -63,11 +105,11 @@ class Navigator:
     # --------- BFS generica verso un target arbitrario ---------
 
     def _bfs_to_target(self, start_node, is_goal_fn):
-        '''
+        """
         BFS sul grafo del mondo.
         start_node: (map_name, x, y)
         is_goal_fn: fn(node) -> bool
-        '''
+        """
         if start_node is None:
             return None, None
 
@@ -120,9 +162,9 @@ class Navigator:
         return None, None
 
     def plan_to_absolute(self, start_map_name, sx, sy, dest_map_name, dx, dy):
-        '''
+        """
         Pianifica un path globale verso (dest_map_name, dx, dy).
-        '''
+        """
         start = (start_map_name, sx, sy)
 
         def is_goal(node):
@@ -140,12 +182,12 @@ class Navigator:
     # --------- Esecuzione step-by-step con gestione collisioni ---------
 
     def step_along_path(self, agent) -> bool:
-        '''
+        """
         Esegue UN passo del path corrente usando l'AgentSystem (che conosce socket e latest_state).
         Ritorna:
           - True se il passo è stato eseguito correttamente o warp
           - False se c'è stata collisione (richiede ricalcolo path esterno)
-        '''
+        """
         if not self.current_dirs:
             return True  # niente da fare
 
@@ -231,9 +273,11 @@ class Navigator:
         return False
 
 
+# ================= GAME BRAIN (LLM) =================
+
 class GameBrain:
     def __init__(self, semantic_path, world: World, metadata_path):
-        # semantic locations / objectives
+        # semantic
         if not os.path.exists(semantic_path):
             self.knowledge = {"locations": {}, "objectives": []}
         else:
@@ -248,30 +292,24 @@ class GameBrain:
             self.metadata = {"maps": {}}
 
         self.world = world
-        self.last_decision_time = 0.0
-        self.cooldown = 2.0
 
-        # README di sistema (linee guida complete per il modello)
-        self.system_prompt = ""
-        readme_path = Path(__file__).with_name(README_FILENAME)
-        try:
-            if readme_path.exists():
-                with open(readme_path, "r", encoding="utf-8") as f:
-                    self.system_prompt = f.read().strip()
-                print(f"[INIT] Caricato README di sistema da {readme_path}")
-            else:
-                print(f"[WARN] README di sistema non trovato: {readme_path}")
-        except Exception as e:
-            print(f"[WARN] Errore nel leggere il README di sistema: {e}")
-            self.system_prompt = ""
+        # rate limiting separato per overworld / battle
+        self.last_overworld_decision = 0.0
+        self.last_battle_decision = 0.0
+        self.cooldown_overworld = 10.0   # 1 richiesta ogni 10s in overworld
+        self.cooldown_battle = 2.0      # 1 richiesta ogni 2s in battle
+
+        # semplice backoff globale su errori
+        self.error_count = 0
+        self.backoff_until = 0.0
 
     # ------- helpers semantici -------
 
     def get_location_name(self, g, n, x, y):
-        '''
+        """
         Prova a mappare (group,num,x,y) a un nome semantico della zona.
         Ritorna la chiave della semantic location o una descrizione generica.
-        '''
+        """
         best_key = None
         best_dist = 9999
         for key, data in self.knowledge.get("locations", {}).items():
@@ -302,10 +340,10 @@ class GameBrain:
         return f"{count} trainers (max sight {max_sight}, patrol={patrols})."
 
     def semantic_locations_summary(self):
-        '''
+        """
         Riduce le semantic locations a qualcosa di digeribile dal modello:
         key -> {type, region, map_group, map_num}
-        '''
+        """
         out = {}
         for key, data in self.knowledge.get("locations", {}).items():
             out[key] = {
@@ -319,9 +357,22 @@ class GameBrain:
     # ------- chiamata LLM -------
 
     def ask_ollama(self, state):
-        # rate limit
-        if time.time() - self.last_decision_time < self.cooldown:
+        mode = state.get("mode", "OVERWORLD")
+        now = time.time()
+
+        # backoff globale se troppi errori consecutivi
+        if now < self.backoff_until:
+            print("[brain] In backoff per errori LLM, skip chiamata.")
             return None
+
+        # rate limit diverso per OVERWORLD / BATTLE
+        if mode == "BATTLE":
+            if now - self.last_battle_decision < self.cooldown_battle:
+                # niente log troppo verboso ogni volta
+                return None
+        else:
+            if now - self.last_overworld_decision < self.cooldown_overworld:
+                return None
 
         g = state["map"]["group"]
         n = state["map"]["num"]
@@ -340,40 +391,48 @@ class GameBrain:
         if mhp > 0:
             hp_pct = int(100 * hp / mhp)
 
-        # prompt dinamico: solo stato corrente + dati estratti dai JSON
-        runtime_context = (
-            "CURRENT RUNTIME CONTEXT:\n"
-            f"- Mode: {state['mode']}\n"
-            f"- Map position: group={g}, num={n}, x={x}, y={y}\n"
-            f"- Nearest semantic location key: {loc_key}\n"
-            f"- Active Pokémon HP: {hp}/{mhp} (~{hp_pct}%)\n"
-            "\n"
-            "WORLD SNAPSHOT:\n"
-            f"- Semantic locations (keys and metadata): {json.dumps(loc_summaries, ensure_ascii=False)}\n"
-            f"- Current high-level objectives: {json.dumps(objectives, ensure_ascii=False)}\n"
-            f"- Local trainers/NPCs: {trainer_info}\n"
-            "\n"
-            "REMINDER:\n"
-            "- Follow the decision schema and constraints defined in the system README above.\n"
-            "- The 'target' field must be either null or one of the semantic location keys provided.\n"
-            "- Answer with a SINGLE valid JSON object only, no extra text.\n"
+        # schema JSON da mostrare al modello
+        schema_str = (
+            '{\n'
+            '  "action": "MOVE" | "PRESS" | "EXPLORE" | "WAIT",\n'
+            '  "target": "string or null",\n'
+            '  "button": "A" | "B" | "START" | "SELECT" | null,\n'
+            '  "policy": {\n'
+            '    "avoid_optional_trainers": true | false,\n'
+            '    "allow_grass_encounters": true | false\n'
+            '  }\n'
+            '}'
         )
 
-        if self.system_prompt:
-            prompt = (
-                self.system_prompt
-                + "\n\n"
-                "------------------------------------------------------------\n"
-                "RUNTIME STATE (do not restate the rules, just apply them)\n"
-                "------------------------------------------------------------\n"
-                + runtime_context
-            )
-        else:
-            # fallback nel caso il README non sia stato caricato
-            prompt = (
-                "You are an AI playing Pokémon Emerald. You control only HIGH-LEVEL decisions.\n\n"
-                + runtime_context
-            )
+        prompt = f"""You are an AI playing Pokémon Emerald. You control only HIGH-LEVEL decisions.
+
+CURRENT STATE:
+- Map position: group={g}, num={n}, x={x}, y={y}
+- Nearest semantic location key: {loc_key}
+- Mode: {state['mode']}
+- Active Pokémon HP: {hp}/{mhp} (~{hp_pct}%)
+
+WORLD KNOWLEDGE:
+- Semantic locations (keys and metadata): {json.dumps(loc_summaries, ensure_ascii=False)}
+- Current high-level objectives: {json.dumps(objectives, ensure_ascii=False)}
+- Local trainers/NPCs: {trainer_info}
+
+DECISION INTERFACE (VERY IMPORTANT):
+You must respond with a SINGLE JSON object (no surrounding text) with this exact schema:
+{schema_str}
+
+GUIDELINES:
+- If a dialog box or battle prompt requires confirmation, choose a PRESS action with "button": "A".
+- If HP% < 30, strongly prefer a MOVE action towards a semantic location whose "type" is "HEAL".
+- To progress the main story, prefer moving toward GYM / TOWN / CITY locations in the early-game region.
+- When the team is weak or low HP, set "avoid_optional_trainers": true and "allow_grass_encounters": false.
+- When grinding is safe, set "avoid_optional_trainers": false and "allow_grass_encounters": true on ROUTE-type maps.
+
+IMPORTANT CONSTRAINTS:
+- The "target" field MUST be either null or one of the keys in the semantic locations dictionary above.
+- You MUST NOT invent or hallucinate new target names that are not present in that dictionary.
+- If you want to move but you are not sure which key is appropriate, prefer action "EXPLORE" with "target": null instead of inventing a new key.
+- Always return VALID JSON only (no comments, no trailing commas)."""
 
         print(f"\n[PROMPT TO LLM] ------------------\n{prompt}\n----------------------------------")
 
@@ -390,17 +449,38 @@ class GameBrain:
                 headers={"Content-Type": "application/json"},
             )
             with urllib.request.urlopen(req, timeout=20) as res:
-                self.last_decision_time = time.time()
                 raw = res.read().decode()
                 outer = json.loads(raw)
-                return outer.get("response")
+
+            # aggiorno il timestamp SOLO se la chiamata è andata a buon fine
+            end = time.time()
+            if mode == "BATTLE":
+                self.last_battle_decision = end
+            else:
+                self.last_overworld_decision = end
+
+            # reset errori / backoff
+            self.error_count = 0
+            self.backoff_until = 0.0
+
+            return outer.get("response")
         except Exception as e:
             print(f"[ERR] Brain/Ollama: {e}")
+            self.error_count += 1
+            if self.error_count >= LLM_MAX_ERRORS_BEFORE_BACKOFF:
+                self.backoff_until = now + LLM_BACKOFF_SECONDS
+                print(
+                    f"[brain] Troppi errori consecutivi ({self.error_count}), "
+                    f"attivo backoff per {LLM_BACKOFF_SECONDS}s."
+                )
             return None
 
 
+# ================= AGENT SYSTEM (rete + loop principale) =================
+
 class AgentSystem:
     def __init__(self):
+        # socket server: mGBA si connette come client dallo script Lua
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind((HOST, PORT))
@@ -414,23 +494,27 @@ class AgentSystem:
         self.latest_state = None
         self.current_target = None  # chiave semantic_location
 
-        # Parametri di tempo
-        self.step_interval = 0.5
-        self.default_hold_frames = 14
+        # Parametri di tempo / ritmo comandi
+        self.step_interval = 0.4          # tempo max per vedere un nuovo stato dopo un input di movimento
+        self.default_hold_frames = 12     # quanti frame tenere premuto un tasto (circa 0.2s a 60fps)
 
     # ------- networking -------
 
     def wait_for_gba(self):
-        print(f"In attesa di mGBA su {PORT}.")
-        self.conn, _ = self.sock.accept()
+        print(f"[net] In attesa di mGBA su {HOST}:{PORT} ...")
+        self.conn, addr = self.sock.accept()
         # usiamo non-blocking per leggere periodicamente
         self.conn.setblocking(False)
-        print("GBA connesso.")
+        print(f"[net] GBA connesso da {addr}.")
 
     def send_input(self, key, frames=10):
+        if not self.conn:
+            print("[ERR] send_input senza connessione attiva.")
+            return
         try:
             msg = f"{key}:{frames}\n".encode()
             self.conn.sendall(msg)
+            print(f"[INPUT] {key} (hold={frames})")
         except Exception as e:
             print(f"[ERR] send_input: {e}")
 
@@ -453,6 +537,7 @@ class AgentSystem:
                 if "map" in s:
                     self.latest_state = s
             except Exception:
+                # riga non-JSON o parziale, la ignoriamo
                 pass
 
     # ------- mapping semantic target -> coordinate assoluta -------
@@ -487,13 +572,20 @@ class AgentSystem:
 
             st = self.latest_state
 
-            # Se in battle -> priorità ai bottoni (si delega tutto al LLM via PRESS)
+            # ================= BATTLE =================
             if st["mode"] == "BATTLE":
                 decision_json = self.brain.ask_ollama(st)
                 if decision_json:
                     self._handle_decision(decision_json, battle_mode=True)
+                else:
+                    # Fallback richiesto: in battle premi A
+                    print("[FALLBACK] BATTLE: nessuna decisione LLM -> Press A")
+                    self.send_input("A", self.default_hold_frames)
+
                 time.sleep(0.1)
                 continue
+
+            # ================= OVERWORLD =================
 
             # 1) se abbiamo un path attivo, cerchiamo di consumarlo
             if self.navigator.current_dirs:
@@ -508,6 +600,9 @@ class AgentSystem:
             decision_json = self.brain.ask_ollama(st)
             if decision_json:
                 self._handle_decision(decision_json, battle_mode=False)
+            else:
+                # Fallback richiesto: in overworld STAND STILL (nessun input)
+                print("[FALLBACK] OVERWORLD: nessuna decisione LLM -> STAND STILL")
 
             time.sleep(0.1)
 
@@ -526,21 +621,23 @@ class AgentSystem:
         policy = dec.get("policy") or {}
         avoid_opt = bool(policy.get("avoid_optional_trainers", True))
         allow_grass = bool(policy.get("allow_grass_encounters", True))
-        # per ora li ignoriamo, ma potresti loggarli o usarli in futuro
-        _ = (avoid_opt, allow_grass)
+        _ = (avoid_opt, allow_grass)  # placeholder per futuri usi
 
         # 1) bottoni immediati
         btn = dec.get("button")
         if btn in ["A", "B", "START", "SELECT"]:
             print(f"[ACT] Press {btn}")
-            self.send_input(btn, 10)
+            self.send_input(btn, self.default_hold_frames)
             return
 
         action = dec.get("action")
 
         if battle_mode:
-            # in battle ignoriamo MOVE / EXPLORE / WAIT (si ri-chiederà la prossima volta)
+            # In battle ignoriamo MOVE / EXPLORE / WAIT
+            # (se l'LLM non ha premuto bottoni, ci pensa il fallback nel loop)
             return
+
+        # ======= OVERWORLD actions =======
 
         if action == "MOVE":
             target_key = dec.get("target")
@@ -568,11 +665,13 @@ class AgentSystem:
                 print(f"[NAV] map_name non risolto per ({g},{n}), impossibile pianificare.")
                 return
 
-            self.navigator.plan_to_absolute(start_map_name, sx, sy, map_name, tx, ty)
+            dirs = self.navigator.plan_to_absolute(start_map_name, sx, sy, map_name, tx, ty)
+            if not dirs:
+                print("[NAV] Nessun path valido verso il target, annullo target.")
+                self.current_target = None
 
         elif action == "EXPLORE":
-            # per ora: passo random semplice, ma sempre monitorato
-            import random
+            # semplice passo random
             key = random.choice(["UP", "DOWN", "LEFT", "RIGHT"])
             print(f"[EXPLORE] step casuale: {key}")
             self.send_input(key, self.default_hold_frames)
@@ -589,6 +688,7 @@ class AgentSystem:
         if not resolved:
             print(f"[NAV] replan: target {self.current_target} non più risolvibile.")
             self.navigator.clear_path()
+            self.current_target = None
             return
 
         map_name, tx, ty = resolved
@@ -601,10 +701,15 @@ class AgentSystem:
         if not start_map_name:
             print(f"[NAV] replan: map_name non risolto per ({g},{n}).")
             self.navigator.clear_path()
+            self.current_target = None
             return
 
         print("[NAV] ricalcolo path per collisione dinamica.")
-        self.navigator.plan_to_absolute(start_map_name, sx, sy, map_name, tx, ty)
+        dirs = self.navigator.plan_to_absolute(start_map_name, sx, sy, map_name, tx, ty)
+        if not dirs:
+            print("[NAV] Nessun path valido verso il target corrente, annullo target.")
+            self.current_target = None
+            self.navigator.clear_path()
 
 
 if __name__ == "__main__":

@@ -56,6 +56,13 @@ In addition, you receive contextual information:
 
   These keys are the **only valid navigation targets** you may use in your decisions.
 
+- Main goal:
+    A list of textual goals, e.g.:
+
+    - Finish the game by defeating the Champion and seeing the credits.
+    - When the team is healthy, always prefer progressing the main story over staying idle in towns.
+
+
 - high-level objectives
   A list of textual goals, e.g.:
 
@@ -192,7 +199,7 @@ When the team is healthy enough, you should try to progress the main story:
     - examples: BIRCH_LAB, LITTLEROOT_CENTER.
 - Then:
   - Move along early routes and towns towards Rustboro:
-    - examples: ROUTE_101_MID, OLDALE_CENTER, ROUTE_102_MID, PETALBURG_CENTER, RUSTBORO_CENTER.
+    - examples: ROUTE_101_MID, OLDALE_CENTER, ROUTE_102_MID, PETALBURG_POKECENTER, RUSTBORO_CENTER.
 - First gym objective:
   - Reach and eventually challenge RUSTBORO_GYM (type "GYM").
 

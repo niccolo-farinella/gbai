@@ -102,8 +102,10 @@
     }
   },
   "objectives": [
+    "Main goal: finish the game by defeating the Champion and seeing the credits. Always progress the main story when it is safe to do so.",
+    "In the early game, when the team is healthy (average team HP >= 50%), prioritize following this story path: PLAYER_HOME_BEDROOM / BIRCH_LAB / LITTLEROOT_CENTER -> ROUTE_101_MID -> OLDALE_CENTER -> ROUTE_102_MID -> PETALBURG_POKECENTER -> RUSTBORO_CENTER -> RUSTBORO_GYM.",
     "Heal at nearest HEAL-type location if average team HP < 30%.",
-    "Progress the main story: obtain starter, deliver package to Rustboro, then challenge RUSTBORO_GYM.",
-    "Avoid unnecessary battles when the team is weak; seek trainer battles on ROUTE-type locations when grinding is needed."
+    "Avoid unnecessary battles when the team is weak; seek trainer battles on ROUTE-type locations when grinding is needed.",
+    "Do not stay idle in towns or cities: if you are already at a TOWN or CITY semantic location and the team is healthy, prefer MOVE towards the next story location instead of WAIT or EXPLORE."
   ]
 }
