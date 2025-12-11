@@ -467,23 +467,17 @@ chiavi e stringhe quotate correttamente.
 
 4. Esecuzione e configurazione
 4.1 Prerequisiti
-
 Python 3.x
-
 mGBA con supporto Lua
-
 Repo pokeemerald per generare/aggiornare overworld_nav.json e overworld_metadata.json (già fatto a monte)
 
 Server Ollama configurato con il modello:
-
 ad es. llama3.2:3b-instruct-q8_0
-
 endpoint HTTP accessibile da ai_player_v3.py
 
+
 4.2 Parametri principali (ai_player_v3.py)
-
 Nel file:
-
 HOST = "127.0.0.1"
 PORT = 8765
 
@@ -493,33 +487,21 @@ SEMANTIC_FILE  = "semantic_locations.json"
 
 OLLAMA_URL   = "http://<host>:<port>/api/generate"
 OLLAMA_MODEL = "llama3.2:3b-instruct-q8_0"
-
-
 Adattare:
-
 OLLAMA_URL all’indirizzo del tuo server Ollama,
-
 eventualmente OLLAMA_MODEL al nome del modello disponibile.
 
 4.3 Flusso di esecuzione
-
 Avvia mGBA con ROM di Pokémon Emerald.
-
 Carica ed esegui emerald_bridge_v3.lua in mGBA.
 
 Avvia il backend AI:
-
 python ai_player_v3.py
-
-
 Lo script attende la connessione da mGBA (wait_for_gba()).
 
 Una volta connessi:
-
 lo stato viene letto in streaming dal Lua client,
 
 ai_player_v3.py inizia il loop decisionale:
-
 se c’è un path attivo → consuma uno step e controlla il nuovo stato,
-
 se non c’è un path attivo → chiama il modello per una nuova decisione.
