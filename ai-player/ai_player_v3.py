@@ -1,342 +1,869 @@
 #!/usr/bin/env python3
-import socket
-import json
-import time
-import urllib.request
-import urllib.error
-import sys
-import os
-from collections import deque
-import importlib.util
-from pathlib import Path
-import random
+"""
+ai_player_v3.py - Stable high-level AI controller for Pokémon Emerald.
 
-# ================= CONFIG =================
+Key design points:
+
+- Listens on TCP for JSON snapshots from emerald_bridge_v4.lua.
+- Keeps a world model using overworld_nav.json + semantic_locations.json.
+- Talks to an LLM (via Ollama HTTP API) ONLY in OVERWORLD and only when a new
+  high-level decision is needed (no spamming at every tick).
+- Executes high-level MOVE decisions by computing an explicit BFS path on the
+  overworld graph and then following it step-by-step.
+- In BATTLE mode, it ignores the LLM and just auto-presses A until the battle
+  and post-battle dialog end.
+- Before each LLM call, it refreshes the current GameState from the latest Lua
+  snapshot and re-checks MODE, so transitions OVERWORLD <-> BATTLE cannot get
+  "stuck".
+- Includes:
+    * runtime schema validation for LLM decisions (Decision.from_llm_payload)
+    * a light FeedbackEngine used only to enrich the LLM prompt
+    * a simple early-game StoryTracker based on semantic locations
+    * pathfinding fallback towards the NEAREST reachable PokéCenter when the
+      requested HEAL target is not reachable in the current overworld graph
+"""
+
+import json
+import os
+import socket
+import threading
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple
+from collections import deque
+import http.client
+
+# =========================
+# CONFIG
+# =========================
+
 HOST = "127.0.0.1"
 PORT = 8765
 
-WORLD_FILE = "overworld-json/overworld_nav.json"
-METADATA_FILE = "overworld-json/overworld_metadata.json"
-SEMANTIC_FILE = "overworld-semantic/semantic_locations.json"
+# PROJECT ROOT LAYOUT:
+#   project/gbai/scripts/ai-player/ai_player_v3.py     (this file)
+#   project/gbai/scripts/ai-player/overworld-json/*.json
+#   project/gbai/scripts/ai-player/overworld-semantic/*.json
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DATA_DIR_JSON_OVERWORLD = PROJECT_ROOT / "scripts/ai-player/overworld-json"
+DATA_DIR_JSON_SEMANTIC = PROJECT_ROOT / "scripts/ai-player/overworld-semantic"
 
-# Path del README (attualmente non usato direttamente nel prompt, ma lasciato per future estensioni)
-README_FILENAME = "readMe-ollama-rag-init.txt"
+OVERWORLD_NAV_JSON = DATA_DIR_JSON_OVERWORLD / "overworld_nav.json"
+OVERWORLD_META_JSON = DATA_DIR_JSON_OVERWORLD / "overworld_metadata.json"  # reserved
+SEMANTIC_LOC_JSON = DATA_DIR_JSON_SEMANTIC / "semantic_locations.json"
 
-# ---- LLM / Ollama ----
+# Optional README for Ollama context (RAG init)
+README_CANDIDATES = [
+    PROJECT_ROOT / "scripts/ai-player/readMe-ollama-rag-init.txt"
+]
 
-LLM_MAX_ERRORS_BEFORE_BACKOFF = 3
-LLM_BACKOFF_SECONDS = 30.0
+# Input defaults
+DEFAULT_MOVE_HOLD_FRAMES = 15
+DEFAULT_BUTTON_HOLD_FRAMES = 4
 
+# LLM / Ollama config
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "127.0.0.1")
+OLLAMA_PORT = int(os.environ.get("OLLAMA_PORT", "11434"))
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2:latest")
 
-def build_ollama_url() -> str:
-    """
-    Costruisce l'URL di Ollama usando, in ordine di priorità:
-    - OLLAMA_URL (env)
-    - OLLAMA_HOST (env)
-    - default locale http://127.0.0.1:11434/api/generate
-    """
-    env_url = os.getenv("OLLAMA_URL")
-    if env_url:
-        base = env_url.strip().rstrip("/")
-        if base.endswith("/api/generate"):
-            return base
-        if base.endswith("/api"):
-            return base + "/generate"
-        return base + "/api/generate"
+# Minimum time between two *new* LLM high-level decisions (only OVERWORLD)
+LLM_DECISION_COOLDOWN = 3.0  # seconds
 
-    env_host = os.getenv("OLLAMA_HOST")
-    if env_host:
-        host = env_host.strip()
-        if not host.startswith("http://") and not host.startswith("https://"):
-            host = "http://" + host
-        base = host.rstrip("/")
-        if base.endswith("/api/generate"):
-            return base
-        if base.endswith("/api"):
-            return base + "/generate"
-        return base + "/api/generate"
+# Safety limit for BFS (to avoid absurd paths)
+MAX_BFS_NODES = 20000
 
-    # fallback di default
-    return "http://127.0.0.1:11434/api/generate"
-
-
-OLLAMA_URL = build_ollama_url()
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:latest")
-
-# =========================================
-# Carichiamo World dinamicamente da backend-movement_v4.py
-# =========================================
-
-BACKEND_PATH = Path(__file__).with_name("backend-movement_v4.py")
-spec = importlib.util.spec_from_file_location("backend_movement_v4", BACKEND_PATH)
-backend_mod = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(backend_mod)
-World = backend_mod.World  # usiamo solo la parte di world / pathfinding
-
-# Mappature direzioni (World -> tasti bridge Lua)
-DIR_NAME_TO_KEY = {
+# Mapping from abstract directions to Lua bridge button names
+DIR_TO_BUTTON = {
     "up": "UP",
     "down": "DOWN",
     "left": "LEFT",
     "right": "RIGHT",
 }
-KEY_TO_DELTA = {
-    "UP": (0, -1),
-    "DOWN": (0, 1),
-    "LEFT": (-1, 0),
-    "RIGHT": (1, 0),
+
+# Mapping from directions to deltas
+DIR_TO_DELTA = {
+    "up": (0, -1),
+    "down": (0, 1),
+    "left": (-1, 0),
+    "right": (1, 0),
 }
 
 
-# ================= NAVIGATOR (pathfinding alto livello) =================
+# =========================
+# WORLD MODEL + PATHFINDING
+# =========================
 
-class Navigator:
+
+class World:
     """
-    Usa World (overworld_nav) per pianificare path cross-map e gestisce i blocchi dinamici
-    (NPC in movimento, trainer che si spostano, ecc.).
+    World wrapper around overworld_nav.json + semantic_locations.json.
+
+    Responsibilities:
+    - map_group/map_num <-> map_name
+    - nearest semantic location lookup
+    - BFS pathfinding between two absolute positions (map_name, x, y)
+    - BFS to nearest Pokémon Center 1F (fallback HEAL target)
     """
-    def __init__(self, world: World):
-        self.world = world
-        # elementi: (map_name, x, y)
-        self.blocked_tiles = set()
-        # lista di nomi direzioni "up"/"down"/"left"/"right"
-        self.current_dirs = []
 
-    # --------- BFS generica verso un target arbitrario ---------
+    def __init__(self, nav_path: Path, sem_path: Path):
+        if not nav_path.exists():
+            raise SystemExit(f"[world] ERRORE: file {nav_path} non trovato.")
+        if not sem_path.exists():
+            raise SystemExit(f"[world] ERRORE: file {sem_path} non trovato.")
 
-    def _bfs_to_target(self, start_node, is_goal_fn):
+        with open(nav_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        self.meta = data.get("meta", {})
+        self.maps: Dict[str, Dict[str, Any]] = data["maps"]
+        self.index: List[Dict[str, Any]] = data["index"]
+
+        # (group, num) -> map_name
+        self.by_group_num: Dict[Tuple[int, int], str] = {}
+        for entry in self.index:
+            self.by_group_num[(entry["group"], entry["num"])] = entry["map_name"]
+
+        # Semantic locations
+        with open(sem_path, "r", encoding="utf-8") as f:
+            sem_data = json.load(f)
+        self.semantic: Dict[str, Dict[str, Any]] = sem_data["locations"]
+
+        # Precompute semantic entries grouped by (group, num)
+        self.semantic_by_map: Dict[Tuple[int, int], List[Tuple[str, Dict[str, Any]]]] = {}
+        for key, loc in self.semantic.items():
+            k = (loc["map_group"], loc["map_num"])
+            self.semantic_by_map.setdefault(k, []).append((key, loc))
+
+        # Count PokéCenter maps for info
+        self.pokecenter_maps: Set[str] = {
+            mname for mname in self.maps.keys() if "PokemonCenter_1F" in mname
+        }
+
+        print(f"[world] Caricate {len(self.index)} mappe.")
+        print(f"[world] Rilevate {len(self.semantic)} location semantiche.")
+        print(f"[world] Rilevati {len(self.pokecenter_maps)} Pokémon Center 1F.")
+
+    # ---- map / semantic helpers ----
+
+    def map_name_from_group_num(self, group: int, num: int) -> Optional[str]:
+        return self.by_group_num.get((group, num))
+
+    def semantic_node_from_key(self, key: str) -> Optional[Tuple[str, int, int]]:
+        loc = self.semantic.get(key)
+        if not loc:
+            return None
+        map_name = self.map_name_from_group_num(loc["map_group"], loc["map_num"])
+        if map_name is None:
+            return None
+        return (map_name, int(loc["x"]), int(loc["y"]))
+
+    def nearest_semantic_location(
+        self, group: int, num: int, x: int, y: int
+    ) -> Tuple[Optional[str], Optional[Dict[str, Any]], Optional[float]]:
+        key = (group, num)
+        candidates = self.semantic_by_map.get(key)
+        if not candidates:
+            return None, None, None
+        best_key = None
+        best_loc = None
+        best_dist = 1e9
+        for skey, loc in candidates:
+            dx = loc["x"] - x
+            dy = loc["y"] - y
+            d = (dx * dx + dy * dy) ** 0.5
+            if d < best_dist:
+                best_dist = d
+                best_key = skey
+                best_loc = loc
+        return best_key, best_loc, best_dist
+
+    # ---- neighbours (copiato dal backend) ----
+
+    def neighbors(
+        self,
+        node: Tuple[str, int, int],
+    ) -> List[Tuple[Tuple[str, int, int], str]]:
         """
-        BFS sul grafo del mondo.
-        start_node: (map_name, x, y)
-        is_goal_fn: fn(node) -> bool
+        Node = (map_name, x, y)
+        Returns a list of (next_node, dir_name) where dir_name in {up,down,left,right}.
         """
-        if start_node is None:
-            return None, None
+        map_name, x, y = node
+        if map_name not in self.maps:
+            return []
 
-        if start_node[0] not in self.world.maps:
-            print(f"[path] mappa sconosciuta: {start_node[0]}")
-            return None, None
+        m = self.maps[map_name]
+        w = m["width"]
+        h = m["height"]
+        grid = m["grid"]
+        conns = {c["direction"]: c for c in m.get("connections", [])}
+        warps = m.get("warp_events", [])
 
-        q = deque()
-        came_from = {}
-        move_from = {}
+        res: List[Tuple[Tuple[str, int, int], str]] = []
 
-        q.append(start_node)
-        came_from[start_node] = None
-        move_from[start_node] = None
+        directions = [
+            ("up", (0, -1)),
+            ("down", (0, 1)),
+            ("left", (-1, 0)),
+            ("right", (1, 0)),
+        ]
+
+        for dir_name, (dx, dy) in directions:
+            nx = x + dx
+            ny = y + dy
+
+            # Case 1: still inside same map
+            if 0 <= nx < w and 0 <= ny < h:
+                # warp?
+                warp_here = None
+                for w_ev in warps:
+                    if w_ev["x"] == nx and w_ev["y"] == ny:
+                        warp_here = w_ev
+                        break
+
+                if warp_here is not None:
+                    dest_map_name = warp_here["dest_map_name"]
+                    if dest_map_name is None:
+                        continue
+                    if dest_map_name not in self.maps:
+                        continue
+                    dest_map = self.maps[dest_map_name]
+                    dest_warp_id = int(warp_here["dest_warp_id"])
+                    dest_warps = dest_map.get("warp_events", [])
+
+                    if 0 <= dest_warp_id < len(dest_warps):
+                        dest_w = dest_warps[dest_warp_id]
+                        tx = dest_w["x"]
+                        ty = dest_w["y"]
+                        if 0 <= tx < dest_map["width"] and 0 <= ty < dest_map["height"]:
+                            if dest_map["grid"][ty][tx]:
+                                res.append(((dest_map_name, tx, ty), dir_name))
+                                continue  # no normal step
+
+                # No warp: normal step if walkable
+                if grid[ny][nx]:
+                    res.append(((map_name, nx, ny), dir_name))
+            else:
+                # Case 2: out of bounds -> connection
+                conn = conns.get(dir_name)
+                if conn is None:
+                    continue
+
+                dest_map_name = conn["map_name"]
+                if dest_map_name is None or dest_map_name not in self.maps:
+                    continue
+                dest_map = self.maps[dest_map_name]
+                dw = dest_map["width"]
+                dh = dest_map["height"]
+                offset = int(conn.get("offset", 0))
+
+                if dir_name == "up":
+                    tx = x + offset
+                    ty = dh - 1
+                elif dir_name == "down":
+                    tx = x + offset
+                    ty = 0
+                elif dir_name == "left":
+                    tx = dw - 1
+                    ty = y + offset
+                else:  # "right"
+                    tx = 0
+                    ty = y + offset
+
+                if 0 <= tx < dw and 0 <= ty < dh and dest_map["grid"][ty][tx]:
+                    res.append(((dest_map_name, tx, ty), dir_name))
+
+        return res
+
+    # ---- BFS generica ----
+
+    def bfs_shortest_path(
+        self,
+        start: Tuple[str, int, int],
+        goal: Tuple[str, int, int],
+        blocked: Optional[Set[Tuple[str, int, int]]] = None,
+    ) -> Tuple[List[Tuple[str, int, int]], List[str]]:
+        """
+        Standard BFS on the overworld graph.
+        Returns (path_nodes, directions)
+        """
+        if start is None or goal is None:
+            return [], []
+
+        if start[0] not in self.maps or goal[0] not in self.maps:
+            print(f"[path] ERRORE: mappa sconosciuta: start={start[0]} goal={goal[0]}")
+            return [], []
+
+        if blocked is None:
+            blocked = set()
+
+        q: Deque[Tuple[str, int, int]] = deque()
+        came_from: Dict[Tuple[str, int, int], Optional[Tuple[str, int, int]]] = {}
+        move_from: Dict[Tuple[str, int, int], Optional[str]] = {}
+
+        q.append(start)
+        came_from[start] = None
+        move_from[start] = None
 
         visited = 0
 
         while q:
             cur = q.popleft()
             visited += 1
+            if visited > MAX_BFS_NODES:
+                print("[path] BFS abortita: troppi nodi esplorati.")
+                break
 
-            if is_goal_fn(cur):
-                # ricostruisci path
-                path = []
-                node = cur
-                while node is not None:
-                    path.append(node)
-                    node = came_from[node]
-                path.reverse()
+            if cur == goal:
+                break
 
-                dirs = []
-                for i in range(1, len(path)):
-                    dirs.append(move_from[path[i]])
-
-                print(
-                    f"[path] Trovato target in {len(path) - 1} passi, "
-                    f"nodi visitati: {visited}"
-                )
-                return path, dirs
-
-            for nxt, dir_name in self.world.neighbors(cur):
-                if (nxt[0], nxt[1], nxt[2]) in self.blocked_tiles:
+            for nxt, dir_name in self.neighbors(cur):
+                if (nxt[0], nxt[1], nxt[2]) in blocked:
                     continue
                 if nxt not in came_from:
                     came_from[nxt] = cur
                     move_from[nxt] = dir_name
                     q.append(nxt)
 
-        print("[path] Nessun target raggiungibile (con i blocchi attuali).")
-        return None, None
+        if goal not in came_from:
+            print("[path] Nessun path trovato.")
+            return [], []
 
-    def plan_to_absolute(self, start_map_name, sx, sy, dest_map_name, dx, dy):
+        path: List[Tuple[str, int, int]] = []
+        node = goal
+        while node is not None:
+            path.append(node)
+            node = came_from[node]
+        path.reverse()
+
+        dirs: List[str] = []
+        for i in range(1, len(path)):
+            dirs.append(move_from[path[i]] or "up")
+
+        print(
+            f"[path] Trovato path di {len(path) - 1} passi "
+            f"(nodi visitati: {visited})."
+        )
+        return path, dirs
+
+    # ---- BFS verso PokéCenter più vicino ----
+
+    def is_pokecenter_goal(self, node: Tuple[str, int, int]) -> bool:
+        map_name, x, y = node
+        return "PokemonCenter_1F" in map_name
+
+    def bfs_to_nearest_pokecenter(
+        self,
+        start: Tuple[str, int, int],
+        blocked: Optional[Set[Tuple[str, int, int]]] = None,
+    ) -> Tuple[List[Tuple[str, int, int]], List[str]]:
         """
-        Pianifica un path globale verso (dest_map_name, dx, dy).
+        BFS non pesata verso qualunque mappa *_PokemonCenter_1F.
         """
-        start = (start_map_name, sx, sy)
+        if start is None:
+            return [], []
 
-        def is_goal(node):
-            m, x, y = node
-            return (m == dest_map_name) and (x == dx) and (y == dy)
+        start_map, sx, sy = start
+        if start_map not in self.maps:
+            print(f"[path] ERRORE: mappa sconosciuta: {start_map}")
+            return [], []
 
-        path, dirs = self._bfs_to_target(start, is_goal)
-        if path is None:
-            # impossibile raggiungere il target con i blocchi correnti
-            self.current_dirs = []
-            print("[NAV] plan_to_absolute: nessun path.")
-            return None
+        if blocked is None:
+            blocked = set()
 
-        # path trovato; dirs può essere lista vuota se siamo già sul target
-        self.current_dirs = dirs or []
-        print(f"[NAV] plan_to_absolute: {len(self.current_dirs)} mosse.")
-        return self.current_dirs
+        q: Deque[Tuple[str, int, int]] = deque()
+        came_from: Dict[Tuple[str, int, int], Optional[Tuple[str, int, int]]] = {}
+        move_from: Dict[Tuple[str, int, int], Optional[str]] = {}
 
-    def clear_path(self):
-        self.current_dirs = []
+        q.append(start)
+        came_from[start] = None
+        move_from[start] = None
 
-    # --------- Esecuzione step-by-step con gestione collisioni ---------
+        visited = 0
+        goal: Optional[Tuple[str, int, int]] = None
 
-    def step_along_path(self, agent) -> bool:
-        """
-        Esegue UN passo del path corrente usando l'AgentSystem (che conosce socket e latest_state).
-        Ritorna:
-          - True se il passo è stato eseguito correttamente o warp
-          - False se c'è stata collisione (richiede ricalcolo path esterno)
-        """
-        if not self.current_dirs:
-            return True  # niente da fare
-
-        dir_name = self.current_dirs.pop(0)
-        key = DIR_NAME_TO_KEY.get(dir_name)
-        if not key:
-            print(f"[NAV] Direzione sconosciuta nel path: {dir_name}")
-            return False
-
-        prev = agent.latest_state
-        if not prev:
-            print("[NAV] Nessuno stato prima del passo, annullo.")
-            return False
-
-        mg = prev["map"]["group"]
-        mn = prev["map"]["num"]
-        px = prev["map"]["x"]
-        py = prev["map"]["y"]
-
-        map_name = agent.world.map_name_from_group_num(mg, mn)
-        if map_name is None:
-            print(f"[NAV] map_name non risolto per ({mg},{mn}), annullo.")
-            return False
-
-        dx, dy = KEY_TO_DELTA[key]
-        target_tile = (map_name, px + dx, py + dy)
-
-        print(f"[NAV] Step {dir_name} -> {target_tile}")
-        agent.send_input(key, agent.default_hold_frames)
-
-        # attendiamo un nuovo stato "stabile" dopo l'input
-        deadline = time.time() + agent.step_interval
-        new_state = None
-        while time.time() < deadline:
-            agent.update_state()
-            st = agent.latest_state
-            if not st:
-                time.sleep(0.05)
-                continue
-
-            # se qualcosa è cambiato (posizione o mappa), assumiamo nuovo stato
-            if (
-                st["map"]["group"] != mg
-                or st["map"]["num"] != mn
-                or st["map"]["x"] != px
-                or st["map"]["y"] != py
-            ):
-                new_state = st
+        while q:
+            cur = q.popleft()
+            visited += 1
+            if visited > MAX_BFS_NODES:
+                print("[path] BFS PokéCenter abortita: troppi nodi.")
                 break
 
-            time.sleep(0.05)
+            if self.is_pokecenter_goal(cur):
+                goal = cur
+                break
 
-        if not new_state:
-            # nessun cambiamento evidente -> consideriamo collisione
-            print("[NAV] Nessun cambio di stato dopo il movimento -> collisione.")
-            self.blocked_tiles.add(target_tile)
-            return False
+            for nxt, dir_name in self.neighbors(cur):
+                if (nxt[0], nxt[1], nxt[2]) in blocked:
+                    continue
+                if nxt not in came_from:
+                    came_from[nxt] = cur
+                    move_from[nxt] = dir_name
+                    q.append(nxt)
 
-        new_mg = new_state["map"]["group"]
-        new_mn = new_state["map"]["num"]
-        new_x = new_state["map"]["x"]
-        new_y = new_state["map"]["y"]
-        new_map_name = agent.world.map_name_from_group_num(new_mg, new_mn)
+        if goal is None:
+            print("[path] Nessun PokéCenter raggiungibile.")
+            return [], []
 
-        # se è cambiata la mappa (warp/connection) consideriamo comunque riuscito
-        if new_map_name != map_name:
-            print(
-                f"[NAV] Warp/connection: {map_name} -> {new_map_name} "
-                f"pos=({new_x},{new_y})"
-            )
-            return True
+        path: List[Tuple[str, int, int]] = []
+        node = goal
+        while node is not None:
+            path.append(node)
+            node = came_from[node]
+        path.reverse()
 
-        # stessa mappa, controlliamo se lo step è quello atteso
-        if (new_x, new_y) == (px + dx, py + dy):
-            return True
+        dirs: List[str] = []
+        for i in range(1, len(path)):
+            dirs.append(move_from[path[i]] or "up")
 
-        # posizione diversa da quella attesa -> collisione/ostacolo dinamico
         print(
-            f"[NAV] Collisione dinamica su {target_tile}, "
-            f"nuovo stato=({new_map_name},{new_x},{new_y})"
+            f"[path] PokéCenter più vicino trovato in {len(path) - 1} passi "
+            f"(nodi visitati: {visited})."
         )
-        self.blocked_tiles.add(target_tile)
-        return False
+        return path, dirs
 
 
-
-# ================= DECISION SCHEMA & FEEDBACK =================
-
-VALID_ACTIONS = {"MOVE", "PRESS", "EXPLORE", "WAIT"}
-VALID_BUTTONS = {None, "A", "B", "START", "SELECT"}
+# =========================
+# NETWORK / STATE FROM LUA
+# =========================
 
 
-def validate_and_fix_decision(decision, valid_targets):
+@dataclass
+class GameState:
+    frame: int
+    mode: str
+    map_group: int
+    map_num: int
+    x: int
+    y: int
+    hp: int
+    max_hp: int
+    map_name: Optional[str] = None
+    nearest_semantic_key: Optional[str] = None
+    nearest_semantic_desc: Optional[str] = None
+    nearest_semantic_type: Optional[str] = None
+    nearest_semantic_region: Optional[str] = None
+
+    @property
+    def hp_ratio(self) -> float:
+        if self.max_hp <= 0:
+            return 1.0
+        return self.hp / self.max_hp
+
+
+class LuaBridge:
     """
-    Runtime validator leggero per la decisione del modello.
-    - action fuori schema -> WAIT
-    - se action == "PRESS": target viene ignorato, button sanificato
-    - se action in {"MOVE","EXPLORE","WAIT"}: button viene ignorato
-    - per MOVE: target dev'essere un semantic key valido, altrimenti None
-    Ritorna (decision_corretto, warnings:list[str]).
+    Handles the TCP link to emerald_bridge_v4.lua.
+
+    - Receives JSON snapshots with mode/map/party.
+    - Maintains the latest GameState (thread-safe).
+    - Sends input commands like "UP:15" or "A:4".
     """
-    warnings = []
-    out = {
-        "action": decision.get("action"),
-        "target": decision.get("target"),
-        "button": decision.get("button"),
-        "policy": decision.get("policy") or {},
-    }
 
-    if out["action"] not in VALID_ACTIONS:
-        warnings.append(f"Unknown action '{out['action']}' -> WAIT")
-        out["action"] = "WAIT"
+    def __init__(self, world: World):
+        self.world = world
+        self.sock: Optional[socket.socket] = None
+        self.sock_file = None
+        self.latest_state: Optional[GameState] = None
+        self.frame_counter = 0
+        self._lock = threading.Lock()
+        self._running = False
 
-    if out["action"] == "PRESS":
-        if out["button"] not in VALID_BUTTONS or out["button"] is None:
-            warnings.append(f"Invalid button '{out['button']}' -> 'A'")
-            out["button"] = "A"
-        # PRESS non usa target
-        out["target"] = None
-    else:
-        # per MOVE/EXPLORE/WAIT ignoriamo sempre button
-        if out["button"] is not None:
-            warnings.append("Ignoring button for non-PRESS action")
-            out["button"] = None
-        if out["action"] == "MOVE":
-            if out["target"] not in valid_targets:
-                warnings.append(f"Invalid MOVE target '{out['target']}' -> null")
-                out["target"] = None
+    # --- connection ---
 
-    # policy defaults
-    pol = out["policy"] or {}
-    if "avoid_optional_trainers" not in pol:
-        pol["avoid_optional_trainers"] = True
-    if "allow_grass_encounters" not in pol:
-        pol["allow_grass_encounters"] = False
-    out["policy"] = pol
+    def start(self):
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind((HOST, PORT))
+        srv.listen(1)
+        print(f"[net] In attesa di mGBA su {HOST}:{PORT} ...")
+        conn, addr = srv.accept()
+        print(f"[net] GBA connesso da {addr}.")
+        self.sock = conn
+        self.sock_file = conn.makefile("rwb")
+        self._running = True
 
-    return out, warnings
+        t = threading.Thread(target=self._reader_loop, daemon=True)
+        t.start()
+
+    def _reader_loop(self):
+        while self._running:
+            try:
+                line = self.sock_file.readline()
+                if not line:
+                    print("[net] Connessione chiusa dal GBA.")
+                    self._running = False
+                    break
+                line = line.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                self._handle_snapshot_line(line)
+            except Exception as e:
+                print(f"[net] Errore nella lettura: {e}")
+                self._running = False
+                break
+
+    def _handle_snapshot_line(self, line: str):
+        try:
+            raw = json.loads(line)
+        except Exception as e:
+            print(f"[net] JSON snapshot non valido: {e} | line={line!r}")
+            return
+
+        mode = raw.get("mode", "OVERWORLD")
+        m = raw.get("map") or {}
+        p = raw.get("party") or {}
+
+        self.frame_counter += 1
+        group = int(m.get("group", 0))
+        num = int(m.get("num", 0))
+        x = int(m.get("x", 0))
+        y = int(m.get("y", 0))
+        hp = int(p.get("hp", 0))
+        max_hp = int(p.get("max_hp", 1))
+
+        map_name = self.world.map_name_from_group_num(group, num)
+        sem_key, sem_loc, _ = self.world.nearest_semantic_location(group, num, x, y)
+
+        gs = GameState(
+            frame=self.frame_counter,
+            mode=mode,
+            map_group=group,
+            map_num=num,
+            x=x,
+            y=y,
+            hp=hp,
+            max_hp=max_hp,
+            map_name=map_name,
+            nearest_semantic_key=sem_key,
+            nearest_semantic_desc=(sem_loc or {}).get("desc") if sem_loc else None,
+            nearest_semantic_type=(sem_loc or {}).get("type") if sem_loc else None,
+            nearest_semantic_region=(sem_loc or {}).get("region") if sem_loc else None,
+        )
+
+        with self._lock:
+            self.latest_state = gs
+
+    # --- public API ---
+
+    def snapshot(self) -> Optional[GameState]:
+        with self._lock:
+            if self.latest_state is None:
+                return None
+            return self.latest_state
+
+    def wait_for_new_state(self, prev_frame: int, timeout: float = 1.0) -> Optional[GameState]:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            st = self.snapshot()
+            if st and st.frame > prev_frame:
+                return st
+            time.sleep(0.02)
+        return self.snapshot()
+
+    def send_input(self, key: str, hold_frames: int):
+        """
+        key: 'UP','DOWN','LEFT','RIGHT','A','B','START','SELECT'
+        """
+        if not self.sock_file:
+            return
+        line = f"{key}:{int(hold_frames)}\n"
+        try:
+            self.sock_file.write(line.encode("utf-8"))
+            self.sock_file.flush()
+            print(f"[input] {line.strip()}")
+        except Exception as e:
+            print(f"[net] Errore nell'invio input: {e}")
 
 
-# Percorso storia minimale (early game); può essere esteso senza toccare il resto.
-STORY_PATH = [
+# =========================
+# DECISION SCHEMA + FEEDBACK
+# =========================
+
+
+@dataclass
+class Decision:
+    action: str  # MOVE | PRESS | EXPLORE | WAIT
+    target: Optional[str] = None  # semantic location key for MOVE/EXPLORE
+    button: Optional[str] = None  # A/B/START/SELECT/UP/DOWN/LEFT/RIGHT
+    policy: Dict[str, Any] = field(default_factory=dict)
+
+    @staticmethod
+    def from_llm_payload(payload: Any) -> "Decision":
+        """
+        Runtime schema validation + normalization.
+        Accepts:
+        - dict
+        - JSON string
+        """
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                raise ValueError("Decision JSON string non valido")
+
+        if not isinstance(payload, dict):
+            raise ValueError("Decision deve essere un oggetto JSON")
+
+        action = str(payload.get("action", "")).upper().strip()
+        if action not in {"MOVE", "PRESS", "EXPLORE", "WAIT"}:
+            action = "WAIT"
+
+        target = payload.get("target")
+        if target is not None:
+            target = str(target).strip()
+            if target == "":
+                target = None
+
+        button = payload.get("button")
+        if button is not None:
+            button = str(button).upper().strip()
+            if button == "":
+                button = None
+
+        policy = payload.get("policy") or {}
+        if not isinstance(policy, dict):
+            policy = {}
+
+        # If not PRESS, ignore button
+        if action != "PRESS":
+            button = None
+
+        return Decision(action=action, target=target, button=button, policy=policy)
+
+
+@dataclass
+class Feedback:
+    outcome: str  # e.g. "OK_PROGRESS", "NO_PROGRESS_HEALTHY", "NO_HEAL_WHEN_LOW_HP", "BATTLE_LOST"
+    comment: str
+
+
+class FeedbackEngine:
+    LOW_HP_THRESHOLD = 0.3
+    HEALTHY_HP_THRESHOLD = 0.7
+
+    def __init__(self):
+        self.last_feedback: Optional[Feedback] = None
+
+    def compute(
+        self,
+        prev_state: Optional[GameState],
+        new_state: Optional[GameState],
+        decision: Optional[Decision],
+    ) -> Optional[Feedback]:
+        if prev_state is None or new_state is None or decision is None:
+            return None
+
+        # BATTLE -> OVERWORLD with HP = 0 => assume loss
+        if prev_state.mode == "BATTLE" and new_state.mode == "OVERWORLD":
+            if new_state.hp <= 0:
+                fb = Feedback(
+                    outcome="BATTLE_LOST",
+                    comment="Hai perso la lotta: HP del Pokémon attivo a 0 dopo la battaglia.",
+                )
+                self.last_feedback = fb
+                return fb
+
+        # OVERWORLD -> OVERWORLD: check movement and healing
+        if prev_state.mode == "OVERWORLD" and new_state.mode == "OVERWORLD":
+            moved = (
+                (prev_state.map_group != new_state.map_group)
+                or (prev_state.map_num != new_state.map_num)
+                or (prev_state.x != new_state.x)
+                or (prev_state.y != new_state.y)
+            )
+
+            hp_ratio = new_state.hp_ratio
+
+            if hp_ratio >= self.HEALTHY_HP_THRESHOLD:
+                if not moved:
+                    fb = Feedback(
+                        outcome="NO_PROGRESS_HEALTHY",
+                        comment="La squadra è in buona salute ma non ti sei mosso dopo la decisione.",
+                    )
+                    self.last_feedback = fb
+                    return fb
+                else:
+                    fb = Feedback(
+                        outcome="OK_PROGRESS",
+                        comment="Squadra sana e hai effettuato progresso nell'overworld.",
+                    )
+                    self.last_feedback = fb
+                    return fb
+
+            if hp_ratio <= self.LOW_HP_THRESHOLD:
+                if decision.action in {"MOVE", "EXPLORE"}:
+                    fb = Feedback(
+                        outcome="NO_HEAL_WHEN_LOW_HP",
+                        comment="HP bassi: sarebbe prudente dirigersi verso un Centro Pokémon.",
+                    )
+                    self.last_feedback = fb
+                    return fb
+
+        fb = Feedback(
+            outcome="NEUTRAL",
+            comment="Nessun effetto evidente (né molto positivo né molto negativo).",
+        )
+        self.last_feedback = fb
+        return fb
+
+
+# =========================
+# BRAIN / LLM CLIENT
+# =========================
+
+
+class Brain:
+    def __init__(self):
+        self.last_decision_time = 0.0
+        self.extra_context: Optional[str] = self._load_readme_context()
+
+    @staticmethod
+    def _load_readme_context() -> Optional[str]:
+        for p in README_CANDIDATES:
+            if p.exists():
+                try:
+                    with open(p, "r", encoding="utf-8") as f:
+                        text = f.read().strip()
+                    print(f"[brain] Caricato README di contesto da {p}.")
+                    return text
+                except Exception as e:
+                    print(f"[brain] Impossibile leggere {p}: {e}")
+        print("[brain] Nessun README di contesto trovato (ok, opzionale).")
+        return None
+
+    def can_query(self) -> bool:
+        return (time.time() - self.last_decision_time) >= LLM_DECISION_COOLDOWN
+
+    def _build_prompt(
+        self,
+        state: GameState,
+        feedback: Optional[Feedback],
+        story_index: int,
+        story_path: List[str],
+    ) -> str:
+        lines: List[str] = []
+        lines.append("You are an AI playing Pokémon Emerald. You control only HIGH-LEVEL decisions.")
+        lines.append("")
+        lines.append("CURRENT STATE:")
+        lines.append(f"- Map position: group={state.map_group}, num={state.map_num}, x={state.x}, y={state.y}")
+        lines.append(f"- Nearest semantic location key: {state.nearest_semantic_key}")
+        lines.append(f"- Mode: {state.mode}")
+        lines.append(f"- Active Pokémon HP: {state.hp}/{state.max_hp} (~{int(state.hp_ratio * 100)}%)")
+        if state.nearest_semantic_region:
+            lines.append(f"- Region: {state.nearest_semantic_region} (semantic type={state.nearest_semantic_type})")
+        lines.append("")
+        lines.append("STORY PROGRESSION:")
+        lines.append(f"- Current story step index: {story_index}")
+        if 0 <= story_index < len(story_path):
+            lines.append(f"- Current story location key: {story_path[story_index]}")
+        next_idx = story_index + 1
+        if 0 <= next_idx < len(story_path):
+            lines.append(f"- Next main story target: {story_path[next_idx]}")
+        else:
+            lines.append("- Next main story target: NONE (end of defined early-game path).")
+        lines.append("")
+        if feedback is not None:
+            lines.append("LAST ACTION FEEDBACK:")
+            lines.append(f"- Outcome: {feedback.outcome}")
+            lines.append(f"- Comment: {feedback.comment}")
+            lines.append("")
+        else:
+            lines.append("LAST ACTION FEEDBACK:")
+            lines.append("- Outcome: NONE (first decision or no data).")
+            lines.append("")
+        lines.append("WORLD KNOWLEDGE (compact):")
+        lines.append('- Semantic locations are keys like "OLDALE_POKECENTER", "ROUTE_102_MID", "RUSTBORO_GYM".')
+        lines.append("- You choose only HIGH-LEVEL actions; low-level steps and timing are handled by the backend.")
+        lines.append("- When HP is low, you should MOVE towards a HEAL-type location (Pokémon Center).")
+        lines.append("- When HP is healthy, you should progress the early-game story towards Rustboro and its Gym.")
+        lines.append("")
+
+        # Optional extended README context (only once)
+        if self.extra_context:
+            lines.append("ADDITIONAL CONTEXT (game/world/navigation guidelines):")
+            lines.append(self.extra_context)
+            lines.append("")
+
+        # Very short explicit schema reminder (to avoid 3x repetition)
+        lines.append("OUTPUT FORMAT:")
+        lines.append("Respond with EXACTLY one JSON object with fields:")
+        lines.append('  action: "MOVE" | "PRESS" | "EXPLORE" | "WAIT"')
+        lines.append('  target: semantic location key or null')
+        lines.append('  button: "A" | "B" | "START" | "SELECT" | null')
+        lines.append('  policy: { "avoid_optional_trainers": bool, "allow_grass_encounters": bool }')
+        lines.append("No extra text, no comments.")
+        return "\n".join(lines)
+
+    def query_llm(
+        self,
+        state: GameState,
+        feedback: Optional[Feedback],
+        story_index: int,
+        story_path: List[str],
+    ) -> Decision:
+        prompt = self._build_prompt(state, feedback, story_index, story_path)
+
+        print("\n[PROMPT TO LLM] ------------------")
+        print(prompt)
+        print("----------------------------------")
+
+        conn = http.client.HTTPConnection(OLLAMA_HOST, OLLAMA_PORT, timeout=60)
+        headers = {"Content-Type": "application/json"}
+        payload = {
+            "model": OLLAMA_MODEL,
+            "prompt": prompt,
+            "stream": False,
+        }
+
+        try:
+            conn.request("POST", "/api/generate", body=json.dumps(payload), headers=headers)
+            resp = conn.getresponse()
+            body = resp.read()
+        finally:
+            conn.close()
+
+        try:
+            data = json.loads(body.decode("utf-8"))
+        except Exception:
+            print("[ERR] Risposta LLM non in JSON, uso WAIT.")
+            self.last_decision_time = time.time()
+            return Decision(action="WAIT")
+
+        text = data.get("response", "")
+        text_stripped = text.strip()
+        print("[RAW LLM RESPONSE] ------------------")
+        print(text_stripped)
+        print("-------------------------------------")
+
+        try:
+            start = text_stripped.find("{")
+            end = text_stripped.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                decision_obj = json.loads(text_stripped[start : end + 1])
+            else:
+                decision_obj = json.loads(text_stripped)
+        except Exception:
+            print("[ERR] Impossibile parsare il JSON di decisione, uso WAIT.")
+            self.last_decision_time = time.time()
+            return Decision(action="WAIT")
+
+        try:
+            decision = Decision.from_llm_payload(decision_obj)
+        except Exception as e:
+            print(f"[ERR] Decision non valida: {e}, uso WAIT.")
+            decision = Decision(action="WAIT")
+
+        self.last_decision_time = time.time()
+        return decision
+
+
+# =========================
+# STORY STATE MACHINE
+# =========================
+
+
+EARLY_GAME_STORY_PATH = [
     "PLAYER_HOME_BEDROOM",
     "BIRCH_LAB",
     "LITTLEROOT_CENTER",
@@ -346,643 +873,319 @@ STORY_PATH = [
     "ROUTE_102_MID",
     "PETALBURG_POKECENTER",
     "RUSTBORO_CENTER",
+    "RUSTBORO_POKECENTER",
     "RUSTBORO_GYM",
 ]
 
 
-class StoryState:
-    def __init__(self):
-        self.index = 0  # indice massimo raggiunto
+class StoryTracker:
+    def __init__(self, story_path: List[str]):
+        self.story_path = story_path
+        self.story_index = 0
 
-    def update_on_arrival(self, reached_key: str):
-        if reached_key in STORY_PATH:
-            i = STORY_PATH.index(reached_key)
-            if i > self.index:
-                self.index = i
+    def update_with_state(self, state: GameState):
+        key = state.nearest_semantic_key
+        if key is None:
+            return
+        try:
+            idx = self.story_path.index(key)
+        except ValueError:
+            return
+        if idx > self.story_index:
+            self.story_index = idx
 
-    def next_target(self):
-        if self.index + 1 < len(STORY_PATH):
-            return STORY_PATH[self.index + 1]
+    def get_current(self) -> Tuple[int, Optional[str]]:
+        if 0 <= self.story_index < len(self.story_path):
+            return self.story_index, self.story_path[self.story_index]
+        return self.story_index, None
+
+    def get_next(self) -> Optional[str]:
+        nxt = self.story_index + 1
+        if 0 <= nxt < len(self.story_path):
+            return self.story_path[nxt]
         return None
 
 
-class FeedbackEngine:
-    """
-    Motore di feedback 'RL-like' puramente simbolico:
-    tiene uno storico locale di decisioni e relativi esiti.
-    """
+# =========================
+# AGENT SYSTEM
+# =========================
 
-    def __init__(self, capacity: int = 50):
-        self.buffer = deque(maxlen=capacity)
-
-    @staticmethod
-    def hp_pct(state):
-        try:
-            hp = max(0, int(state["party"].get("hp", 0)))
-            mhp = max(1, int(state["party"].get("max_hp", 1)))
-            return hp / mhp
-        except Exception:
-            return 1.0
-
-    @staticmethod
-    def is_heal_key(key, semantic_dict):
-        if not key:
-            return False
-        info = semantic_dict.get(key, {})
-        return info.get("type") == "HEAL"
-
-    @staticmethod
-    def is_pokecenter_map(world, group, num):
-        try:
-            name = world.map_name_from_group_num(group, num)
-        except Exception:
-            return False
-        if not name:
-            return False
-        return "PokemonCenter_1F" in name
-
-    def evaluate(self, state_before, decision, state_after, semantic_dict, world):
-        """
-        Regole:
-        - OVERWORLD:
-            - se HP% >= 50 e la posizione non cambia (e non è PRESS) -> score -1 ("idle_while_healthy")
-            - se HP% < 30 e il target non è HEAL -> score -1 ("not_healing_while_low_hp")
-        - BATTLE:
-            - unico caso negativo: sconfitta (euristica blackout a PC)
-        Altrimenti score 0.
-        """
-        try:
-            mode_before = state_before.get("mode")
-            mode_after = state_after.get("mode")
-            mb = state_before["map"]
-            ma = state_after["map"]
-            pos_b = (mb["group"], mb["num"], mb["x"], mb["y"])
-            pos_a = (ma["group"], ma["num"], ma["x"], ma["y"])
-        except Exception:
-            return 0, "incomplete_state"
-
-        # BATTLE: unica penalità è sconfitta (blackout al PokéCenter)
-        if mode_before == "BATTLE":
-            if (
-                mode_after == "OVERWORLD"
-                and self.is_pokecenter_map(world, ma["group"], ma["num"])
-            ):
-                return -1, "battle_defeat_blackout"
-            return 0, "battle_progress_or_unknown"
-
-        # OVERWORLD
-        hp_b = self.hp_pct(state_before)
-        action = decision.get("action")
-        target = decision.get("target")
-
-        if hp_b >= 0.50 and pos_b == pos_a and action != "PRESS":
-            return -1, "idle_while_healthy"
-
-        if hp_b < 0.30:
-            if not self.is_heal_key(target, semantic_dict):
-                return -1, "not_healing_while_low_hp"
-
-        return 0, "neutral"
-
-    def push(self, state_before, decision, state_after, semantic_dict, world):
-        score, reason = self.evaluate(
-            state_before, decision, state_after, semantic_dict, world
-        )
-        item = {
-            "ts": time.time(),
-            "decision": decision,
-            "score": score,
-            "reason": reason,
-            "before": {
-                "mode": state_before.get("mode"),
-                "pos": state_before.get("map"),
-                "hp": state_before.get("party"),
-            },
-            "after": {
-                "mode": state_after.get("mode"),
-                "pos": state_after.get("map"),
-                "hp": state_after.get("party"),
-            },
-        }
-        self.buffer.append(item)
-        return item
-
-
-def build_last_action_summary(feedback_engine):
-    if not feedback_engine or not feedback_engine.buffer:
-        return "No previous decision."
-    last = feedback_engine.buffer[-1]
-    d = last["decision"]
-    b = last["before"]["pos"]
-    a = last["after"]["pos"]
-    return (
-        f"Previous decision: {d.get('action')} -> "
-        f"target={d.get('target')} button={d.get('button')}. "
-        f"Result: {last['reason']} (score={last['score']}). "
-        f"Was at map=({b['group']},{b['num']})@({b['x']},{b['y']}); "
-        f"now at map=({a['group']},{a['num']})@({a['x']},{a['y']})."
-    )
-
-
-# ================= GAME BRAIN (LLM) =================
-
-class GameBrain:
-    def __init__(self, semantic_path, world: World, metadata_path):
-        # semantic
-        if not os.path.exists(semantic_path):
-            self.knowledge = {"locations": {}, "objectives": []}
-        else:
-            with open(semantic_path, "r", encoding="utf-8") as f:
-                self.knowledge = json.load(f)
-
-        # metadata trainer/NPC
-        if os.path.exists(metadata_path):
-            with open(metadata_path, "r", encoding="utf-8") as f:
-                self.metadata = json.load(f)
-        else:
-            self.metadata = {"maps": {}}
-
-        self.world = world
-
-        # rate limiting separato per overworld / battle
-        self.last_overworld_decision = 0.0
-        self.last_battle_decision = 0.0
-        self.cooldown_overworld = 10.0   # 1 richiesta ogni 10s in overworld
-        self.cooldown_battle = 2.0      # 1 richiesta ogni 2s in battle
-
-        # semplice backoff globale su errori
-        self.error_count = 0
-        self.backoff_until = 0.0
-
-    # ------- helpers semantici -------
-
-    def get_location_name(self, g, n, x, y):
-        """
-        Prova a mappare (group,num,x,y) a un nome semantico della zona.
-        Ritorna la chiave della semantic location o una descrizione generica.
-        """
-        best_key = None
-        best_dist = 9999
-        for key, data in self.knowledge.get("locations", {}).items():
-            if data.get("map_group") != g or data.get("map_num") != n:
-                continue
-            dist = abs(data.get("x", 0) - x) + abs(data.get("y", 0) - y)
-            if dist < best_dist:
-                best_dist = dist
-                best_key = key
-
-        if best_key is not None:
-            return best_key
-        return f"map({g},{n})@({x},{y})"
-
-    def summarize_trainers_here(self, g, n):
-        map_name = self.world.map_name_from_group_num(g, n)
-        if not map_name:
-            return "No metadata."
-
-        mdata = self.metadata.get("maps", {}).get(map_name, {})
-        trainers = mdata.get("trainers", [])
-        if not trainers:
-            return "No visible trainers."
-
-        count = len(trainers)
-        max_sight = max(t.get("sight_range", 0) for t in trainers)
-        patrols = sum(1 for t in trainers if t.get("movement_pattern") == "patrol")
-        return f"{count} trainers (max sight {max_sight}, patrol={patrols})."
-
-    def semantic_locations_summary(self):
-        """
-        Riduce le semantic locations a qualcosa di digeribile dal modello:
-        key -> {type, region, map_group, map_num}
-        """
-        out = {}
-        for key, data in self.knowledge.get("locations", {}).items():
-            out[key] = {
-                "type": data.get("type", "GENERIC"),
-                "region": data.get("region", "UNKNOWN"),
-                "map_group": data.get("map_group"),
-                "map_num": data.get("map_num"),
-            }
-        return out
-
-    # ------- chiamata LLM -------
-
-    def ask_ollama(self, state, last_action_summary=None, story_next_target=None):
-        mode = state.get("mode", "OVERWORLD")
-        now = time.time()
-
-        # backoff globale se troppi errori consecutivi
-        if now < self.backoff_until:
-            print("[brain] In backoff per errori LLM, skip chiamata.")
-            return None
-
-        # rate limit diverso per OVERWORLD / BATTLE
-        if mode == "BATTLE":
-            if now - self.last_battle_decision < self.cooldown_battle:
-                # niente log troppo verboso ogni volta
-                return None
-        else:
-            if now - self.last_overworld_decision < self.cooldown_overworld:
-                return None
-
-        g = state["map"]["group"]
-        n = state["map"]["num"]
-        x = state["map"]["x"]
-        y = state["map"]["y"]
-
-        loc_key = self.get_location_name(g, n, x, y)
-        trainer_info = self.summarize_trainers_here(g, n)
-
-        loc_summaries = self.semantic_locations_summary()
-        objectives = self.knowledge.get("objectives", [])
-
-        hp = state["party"]["hp"]
-        mhp = state["party"]["max_hp"]
-        hp_pct = 0
-        if mhp > 0:
-            hp_pct = int(100 * hp / mhp)
-
-        # schema JSON da mostrare al modello
-        schema_str = (
-            '{\n'
-            '  "action": "MOVE" | "PRESS" | "EXPLORE" | "WAIT",\n'
-            '  "target": "string or null",\n'
-            '  "button": "A" | "B" | "START" | "SELECT" | null,\n'
-            '  "policy": {\n'
-            '    "avoid_optional_trainers": true | false,\n'
-            '    "allow_grass_encounters": true | false\n'
-            '  }\n'
-            '}'
-        )
-
-        las = last_action_summary or "No previous decision."
-        story_line = (
-            f"- Next main story target: {story_next_target}"
-            if story_next_target
-            else "- Next main story target: (none / free-roam)"
-        )
-
-        prompt = f"""You are an AI playing Pokémon Emerald. You control only HIGH-LEVEL decisions.
-
-LAST ACTION SUMMARY:
-- {las}
-
-CURRENT STATE:
-- Map position: group={g}, num={n}, x={x}, y={y}
-- Nearest semantic location key: {loc_key}
-- Mode: {state['mode']}
-- Active Pokémon HP: {hp}/{mhp} (~{hp_pct}%)
-
-STORY PROGRESSION:
-{story_line}
-
-WORLD KNOWLEDGE:
-- Semantic locations (keys and metadata): {json.dumps(loc_summaries, ensure_ascii=False)}
-- Current high-level objectives: {json.dumps(objectives, ensure_ascii=False)}
-- Local trainers/NPCs: {trainer_info}
-
-DECISION INTERFACE (VERY IMPORTANT):
-You must respond with a SINGLE JSON object (no surrounding text) with this exact schema:
-{schema_str}
-
-GUIDELINES:
-- If a dialog box or battle prompt requires confirmation, choose a PRESS action with "button": "A".
-- If HP% < 30, strongly prefer a MOVE action towards a semantic location whose "type" is "HEAL".
-- To progress the main story, prefer moving toward GYM / TOWN / CITY locations in the early-game region.
-- When the team is weak or low HP, set "avoid_optional_trainers": true and "allow_grass_encounters": false.
-- When grinding is safe, set "avoid_optional_trainers": false and "allow_grass_encounters": true on ROUTE-type maps.
-
-IMPORTANT CONSTRAINTS:
-- The "target" field MUST be either null or one of the keys in the semantic locations dictionary above.
-- You MUST NOT invent or hallucinate new target names that are not present in that dictionary.
-- If you want to move but you are not sure which key is appropriate, prefer action "EXPLORE" with "target": null instead of inventing a new key.
-- Always return VALID JSON only (no comments, no trailing commas)."""
-
-        print(f"\n[PROMPT TO LLM] ------------------\n{prompt}\n----------------------------------")
-
-        try:
-            payload = {
-                "model": OLLAMA_MODEL,
-                "prompt": prompt,
-                "stream": False,
-                "format": "json",
-            }
-            req = urllib.request.Request(
-                OLLAMA_URL,
-                data=json.dumps(payload).encode(),
-                headers={"Content-Type": "application/json"},
-            )
-            with urllib.request.urlopen(req, timeout=20) as res:
-                raw = res.read().decode()
-                outer = json.loads(raw)
-
-            # aggiorno il timestamp SOLO se la chiamata è andata a buon fine
-            end = time.time()
-            if mode == "BATTLE":
-                self.last_battle_decision = end
-            else:
-                self.last_overworld_decision = end
-
-            # reset errori / backoff
-            self.error_count = 0
-            self.backoff_until = 0.0
-
-            return outer.get("response")
-        except Exception as e:
-            print(f"[ERR] Brain/Ollama: {e}")
-            self.error_count += 1
-            if self.error_count >= LLM_MAX_ERRORS_BEFORE_BACKOFF:
-                self.backoff_until = now + LLM_BACKOFF_SECONDS
-                print(
-                    f"[brain] Troppi errori consecutivi ({self.error_count}), "
-                    f"attivo backoff per {LLM_BACKOFF_SECONDS}s."
-                )
-            return None
-
-
-# ================= AGENT SYSTEM (rete + loop principale) =================
 
 class AgentSystem:
     def __init__(self):
-        # socket server: mGBA si connette come client dallo script Lua
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind((HOST, PORT))
-        self.sock.listen(1)
-        self.conn = None
-
-        self.world = World(WORLD_FILE)
-        self.navigator = Navigator(self.world)
-        self.brain = GameBrain(SEMANTIC_FILE, self.world, METADATA_FILE)
-
-        # stato "alto livello" per storia e feedback
-        self.story_state = StoryState()
+        self.world = World(OVERWORLD_NAV_JSON, SEMANTIC_LOC_JSON)
+        self.lua = LuaBridge(self.world)
+        self.brain = Brain()
         self.feedback_engine = FeedbackEngine()
-        self.last_state_before_decision = None
-        self.last_decision = None
+        self.story = StoryTracker(EARLY_GAME_STORY_PATH)
 
-        self.latest_state = None
-        self.current_target = None  # chiave semantic_location
+        self.last_state: Optional[GameState] = None
+        self.last_decision: Optional[Decision] = None
 
-        # Parametri di tempo / ritmo comandi
-        self.step_interval = 0.4          # tempo max per vedere un nuovo stato dopo un input di movimento
-        self.default_hold_frames = 12     # quanti frame tenere premuto un tasto (circa 0.2s a 60fps)
+        # Path currently being executed (directions like "up","down",...)
+        self.current_path_dirs: Deque[str] = deque()
+        self.current_path_target_key: Optional[str] = None
 
-    # ------- networking -------
+        # Dynamic blocked tiles (NPCs, moving trainers, etc.)
+        self.blocked_tiles: Set[Tuple[str, int, int]] = set()
 
-    def wait_for_gba(self):
-        print(f"[net] In attesa di mGBA su {HOST}:{PORT} ...")
-        self.conn, addr = self.sock.accept()
-        # usiamo non-blocking per leggere periodicamente
-        self.conn.setblocking(False)
-        print(f"[net] GBA connesso da {addr}.")
-
-    def send_input(self, key, frames=10):
-        if not self.conn:
-            print("[ERR] send_input senza connessione attiva.")
-            return
-        try:
-            msg = f"{key}:{frames}\n".encode()
-            self.conn.sendall(msg)
-            print(f"[INPUT] {key} (hold={frames})")
-        except Exception as e:
-            print(f"[ERR] send_input: {e}")
-
-    def update_state(self):
-        if not self.conn:
-            return
-        try:
-            data = self.conn.recv(8192).decode()
-        except BlockingIOError:
-            return
-        except Exception:
-            return
-
-        for line in data.split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                s = json.loads(line)
-                if "map" in s:
-                    self.latest_state = s
-            except Exception:
-                # riga non-JSON o parziale, la ignoriamo
-                pass
-
-    # ------- mapping semantic target -> coordinate assoluta -------
-
-    def resolve_semantic_target(self, key):
-        locs = self.brain.knowledge.get("locations", {})
-        data = locs.get(key)
-        if not data:
-            return None
-
-        g = data["map_group"]
-        n = data["map_num"]
-        x = data.get("x", 0)
-        y = data.get("y", 0)
-        map_name = self.world.map_name_from_group_num(g, n)
-        if not map_name:
-            return None
-
-        return (map_name, x, y)
-
-    # ------- loop principale -------
+        # Info about the last move we actually sent
+        self.last_move_info: Optional[Dict[str, Any]] = None
 
     def run(self):
-        self.wait_for_gba()
+        self.lua.start()
+
+        # Wait for first state
+        state = None
+        while state is None:
+            state = self.lua.snapshot()
+            if state is None:
+                time.sleep(0.1)
+
+        self.last_state = state
+        self.story.update_with_state(state)
+
+        print("[agent] Avvio loop principale AI.")
+        prev_frame = state.frame
 
         while True:
-            # Aggiorna stato
-            self.update_state()
-            if not self.latest_state:
-                time.sleep(0.05)
+            # 1) Wait for new snapshot
+            state = self.lua.wait_for_new_state(prev_frame, timeout=1.0)
+            if state is None:
+                print("[agent] Nessuno stato disponibile, esco.")
+                break
+
+            # 1bis) Evaluate outcome of the last move (for collisions / progress)
+            self._evaluate_last_move(state)
+
+            # Update story tracker and feedback
+            self.story.update_with_state(state)
+            feedback = self.feedback_engine.compute(self.last_state, state, self.last_decision)
+            self.last_state = state
+            prev_frame = state.frame
+
+            # 2) BATTLE mode: ignore LLM and just mash A
+            if state.mode == "BATTLE":
+                self._handle_battle_mode()
                 continue
 
-            st = self.latest_state
-
-            # feedback sulla decisione precedente, se disponibile
-            if self.last_decision is not None and self.last_state_before_decision is not None:
-                semantic_dict = self.brain.knowledge.get("locations", {})
-                fb_item = self.feedback_engine.push(
-                    self.last_state_before_decision,
-                    self.last_decision,
-                    st,
-                    semantic_dict,
-                    self.world,
-                )
-                print(f"[FEEDBACK] score={fb_item['score']} reason={fb_item['reason']}")
-                self.last_decision = None
-                self.last_state_before_decision = None
-
-            last_action_summary = build_last_action_summary(self.feedback_engine)
-            story_next_target = self.story_state.next_target()
-
-            # ================= BATTLE =================
-            if st["mode"] == "BATTLE":
-                decision_json = self.brain.ask_ollama(
-                    st,
-                    last_action_summary=last_action_summary,
-                    story_next_target=story_next_target,
-                )
-                if decision_json:
-                    self._handle_decision(decision_json, battle_mode=True)
-                else:
-                    # Fallback richiesto: in battle premi A
-                    print("[FALLBACK] BATTLE: nessuna decisione LLM -> Press A")
-                    self.send_input("A", self.default_hold_frames)
-
-                time.sleep(0.1)
+            # 3) OVERWORLD: if we have a path, keep following it (no new LLM call)
+            if self.current_path_dirs:
+                self._step_along_current_path(state)
                 continue
 
-            # ================= OVERWORLD =================
-
-            # 1) se abbiamo un path attivo, cerchiamo di consumarlo
-            if self.navigator.current_dirs:
-                ok = self.navigator.step_along_path(self)
-                if not ok:
-                    # collisione: forziamo ricalcolo path sul target attuale
-                    self._replan_to_current_target()
-                time.sleep(0.05)
+            # 4) No path: possibly ask LLM for a NEW high-level decision
+            if not self.brain.can_query():
+                # Cooldown active -> stand still
+                print("[FALLBACK] OVERWORLD: cooldown LLM -> STAND STILL")
                 continue
 
-            # 2) nessun path attivo -> chiediamo al LLM un nuovo obiettivo
-            decision_json = self.brain.ask_ollama(
-                st,
-                last_action_summary=last_action_summary,
-                story_next_target=story_next_target,
+            # Strictly refresh state before querying the LLM (mode sync)
+            fresh_state = self.lua.snapshot() or state
+
+            if fresh_state.mode == "BATTLE":
+                # Mode changed to battle while we were about to query -> battle logic
+                self._handle_battle_mode()
+                continue
+
+            self.story.update_with_state(fresh_state)
+            story_index, _ = self.story.get_current()
+
+            decision = self.brain.query_llm(
+                fresh_state,
+                self.feedback_engine.last_feedback,
+                story_index,
+                self.story.story_path,
             )
-            if decision_json:
-                self._handle_decision(decision_json, battle_mode=False)
-            else:
-                # Fallback richiesto: in overworld STAND STILL (nessun input)
-                print("[FALLBACK] OVERWORLD: nessuna decisione LLM -> STAND STILL")
+            self.last_decision = decision
 
-            time.sleep(0.1)
+            # Execute the high-level decision (this may create a path)
+            self._execute_high_level_decision(fresh_state, decision)
 
-    # ------- gestione decisione LLM -------
+    # ---- internal helpers ----
 
-    def _handle_decision(self, decision_json, battle_mode: bool):
-        try:
-            dec_raw = json.loads(decision_json) if isinstance(decision_json, str) else decision_json
-        except Exception as e:
-            print(f"[ERR] parsing decision_json: {e}")
+    def _handle_battle_mode(self):
+        print("[MODE] BATTLE -> auto-press A")
+        self.lua.send_input("A", DEFAULT_BUTTON_HOLD_FRAMES)
+        # Do NOT clear current_path_dirs; after the battle we can try to resume.
+
+    def _evaluate_last_move(self, state: GameState):
+        """
+        Compare the new state with the last move we sent.
+        If we clearly hit a collision on a predicted tile in OVERWORLD,
+        mark that tile as blocked and clear the current path so it will be replanned.
+        """
+        if self.last_move_info is None:
             return
 
-        # validazione runtime dello schema decisionale
-        valid_targets = list(self.brain.knowledge.get("locations", {}).keys())
-        dec, warnings = validate_and_fix_decision(dec_raw, valid_targets)
-        if warnings:
-            for w in warnings:
-                print(f"[SCHEMA] {w}")
-
-        print(f"[LLM] decision: {dec}")
-
-        # estrai policy (non ancora usata nel pathfinding, ma tenuta per futuro)
-        policy = dec.get("policy") or {}
-        avoid_opt = bool(policy.get("avoid_optional_trainers", True))
-        allow_grass = bool(policy.get("allow_grass_encounters", True))
-        _ = (avoid_opt, allow_grass)  # placeholder per futuri usi
-
-        action = dec.get("action")
-        btn = dec.get("button")
-
-        # 1) azioni PRESS (bottoni immediati)
-        if action == "PRESS":
-            if btn not in ["A", "B", "START", "SELECT"]:
-                btn = "A"
-            print(f"[ACT] Press {btn}")
-            self.send_input(btn, self.default_hold_frames)
+        lm = self.last_move_info
+        # Ensure we have advanced at least one frame
+        if state.frame <= lm["frame"]:
             return
 
-        if battle_mode:
-            # In battle ignoriamo MOVE / EXPLORE / WAIT
-            # (se l'LLM non ha premuto bottoni, ci pensa il fallback nel loop)
+        # If map changed (warp/connection), we consider the move successful.
+        if state.map_group != lm["map_group"] or state.map_num != lm["map_num"]:
+            print(
+                f"[path] Warp/connection: map ({lm['map_group']},{lm['map_num']}) -> "
+                f"({state.map_group},{state.map_num}), pos=({state.x},{state.y})"
+            )
+            if self.current_path_dirs and self.current_path_dirs[0] == lm["dir_name"]:
+                self.current_path_dirs.popleft()
+            self.last_move_info = None
             return
 
-        # ======= OVERWORLD actions =======
+        # Same map: check if we reached the expected tile
+        px, py = lm["x"], lm["y"]
+        dx, dy = DIR_TO_DELTA.get(lm["dir_name"], (0, 0))
+        expected_x = px + dx
+        expected_y = py + dy
 
-        if action == "MOVE":
-            target_key = dec.get("target")
-            if not target_key:
-                print("[NAV] MOVE senza target, ignorato.")
-                return
-
-            resolved = self.resolve_semantic_target(target_key)
-            if not resolved:
-                print(f"[NAV] Target semantico sconosciuto: {target_key}")
-                return
-
-            map_name, tx, ty = resolved
-            self.current_target = target_key
-            # opzionale: puoi decidere se pulire o mantenere i blocchi tra obiettivi diversi
-            self.navigator.blocked_tiles.clear()
-
-            g = self.latest_state["map"]["group"]
-            n = self.latest_state["map"]["num"]
-            sx = self.latest_state["map"]["x"]
-            sy = self.latest_state["map"]["y"]
-            start_map_name = self.world.map_name_from_group_num(g, n)
-
-            if not start_map_name:
-                print(f"[NAV] map_name non risolto per ({g},{n}), impossibile pianificare.")
-                return
-
-            dirs = self.navigator.plan_to_absolute(start_map_name, sx, sy, map_name, tx, ty)
-            if dirs is None:
-                print("[NAV] Nessun path valido verso il target, annullo target.")
-                self.current_target = None
-            elif len(dirs) == 0:
-                print("[NAV] Nessun movimento necessario: già sul target.")
-                # aggiorna progressione storia in base al target raggiunto
-                self.story_state.update_on_arrival(target_key)
-
-        elif action == "EXPLORE":
-            # semplice passo random
-            key = random.choice(["UP", "DOWN", "LEFT", "RIGHT"])
-            print(f"[EXPLORE] step casuale: {key}")
-            self.send_input(key, self.default_hold_frames)
-
-        elif action == "WAIT":
-            print("[ACT] WAIT (nessun input).")
-            # niente input, solo pausa
-
-    def _replan_to_current_target(self):
-        if not self.current_target or not self.latest_state:
+        if (state.x, state.y) == (expected_x, expected_y):
+            # Movement succeeded
+            if self.current_path_dirs and self.current_path_dirs[0] == lm["dir_name"]:
+                self.current_path_dirs.popleft()
+            self.last_move_info = None
             return
 
-        resolved = self.resolve_semantic_target(self.current_target)
-        if not resolved:
-            print(f"[NAV] replan: target {self.current_target} non più risolvibile.")
-            self.navigator.clear_path()
-            self.current_target = None
+        # Neither warp/connection nor correct step: treat as collision
+        blocked_tile = (lm["map_name"], expected_x, expected_y)
+        print(
+            f"[path] Collisione o blocco su {blocked_tile}, nuovo stato=({state.map_name},{state.x},{state.y})."
+        )
+        self.blocked_tiles.add(blocked_tile)
+        # Drop current path so that next decision can replan
+        self.current_path_dirs.clear()
+        self.last_move_info = None
+
+    def _step_along_current_path(self, state: GameState):
+        """
+        Take one step along the current path: send the D-Pad input that corresponds
+        to the next direction in the queue and remember what we attempted.
+        """
+        if not self.current_path_dirs:
             return
 
-        map_name, tx, ty = resolved
-        g = self.latest_state["map"]["group"]
-        n = self.latest_state["map"]["num"]
-        sx = self.latest_state["map"]["x"]
-        sy = self.latest_state["map"]["y"]
-        start_map_name = self.world.map_name_from_group_num(g, n)
-
-        if not start_map_name:
-            print(f"[NAV] replan: map_name non risolto per ({g},{n}).")
-            self.navigator.clear_path()
-            self.current_target = None
+        dir_name = self.current_path_dirs[0]
+        btn = DIR_TO_BUTTON.get(dir_name)
+        if btn is None:
+            print(f"[path] Direzione sconosciuta nel path: {dir_name}, scarto.")
+            self.current_path_dirs.popleft()
             return
 
-        print("[NAV] ricalcolo path per collisione dinamica.")
-        dirs = self.navigator.plan_to_absolute(start_map_name, sx, sy, map_name, tx, ty)
-        if dirs is None:
-            print("[NAV] Nessun path valido verso il target corrente, annullo target.")
-            self.current_target = None
-            self.navigator.clear_path()
-        elif len(dirs) == 0:
-            print("[NAV] Già sul target corrente dopo il ricalcolo; nessuna mossa necessaria.")
-            self.story_state.update_on_arrival(self.current_target)
-            self.navigator.clear_path()
+        print(f"[ACT] Follow path: {dir_name}")
+        # Remember what we are trying to do
+        self.last_move_info = {
+            "frame": state.frame,
+            "map_group": state.map_group,
+            "map_num": state.map_num,
+            "map_name": state.map_name,
+            "x": state.x,
+            "y": state.y,
+            "dir_name": dir_name,
+        }
+        self.lua.send_input(btn, DEFAULT_MOVE_HOLD_FRAMES)
+
+    def _execute_high_level_decision(self, state: GameState, decision: Decision):
+        print(
+            f"[DECISION] action={decision.action}, "
+            f"target={decision.target}, button={decision.button}, policy={decision.policy}"
+        )
+
+        if state.mode == "BATTLE":
+            self._handle_battle_mode()
+            return
+
+        if decision.action == "PRESS":
+            btn = decision.button or "A"
+            self.lua.send_input(btn, DEFAULT_BUTTON_HOLD_FRAMES)
+            # Press decisions do not affect path
+            return
+
+        if decision.action in {"MOVE", "EXPLORE"}:
+            self._plan_path_for_move(state, decision)
+            # The actual step will be taken on the next loop iteration
+            return
+
+        if decision.action == "WAIT":
+            print("[ACT] WAIT / STAND STILL")
+            return
+
+        print("[ACT] Azione sconosciuta, STAND STILL")
+
+    def _plan_path_for_move(self, state: GameState, decision: Decision):
+        """
+        Compute a BFS path for a MOVE / EXPLORE decision.
+
+        - MOVE with a valid target key:
+            * try BFS to that semantic location
+            * if unreachable and the target is HEAL, fallback to nearest reachable PokéCenter
+        - EXPLORE or MOVE with invalid target:
+            * do a very short local exploration step without BFS
+        """
+        # Reset previous path info
+        self.current_path_dirs.clear()
+        self.last_move_info = None
+
+        start_map_name = state.map_name
+        if start_map_name is None:
+            print("[path] Nessun map_name nello stato corrente, non posso pianificare.")
+            return
+        start_node = (start_map_name, state.x, state.y)
+
+        target_key = decision.target
+
+        # Case 1: EXPLORE or MOVE with no target -> local exploration
+        if decision.action == "EXPLORE" or not target_key:
+            print("[path] EXPLORE/MOVE senza target valido, uso fallback locale (UP).")
+            self.current_path_dirs.append("up")
+            self.current_path_target_key = None
+            return
+
+        # Case 2: MOVE with target key: try semantic lookup
+        goal_node = self.world.semantic_node_from_key(target_key)
+
+        path_dirs: List[str] = []
+        used_fallback = False
+
+        if goal_node is not None:
+            print(f"[path] Pianifico path da {start_node} a {goal_node} (target={target_key}).")
+            path, dirs = self.world.bfs_shortest_path(start_node, goal_node, blocked=self.blocked_tiles)
+            path_dirs = dirs
+
+        # If direct path failed and it's a HEAL target, fallback to nearest PokéCenter
+        if not path_dirs:
+            loc_info = self.world.semantic.get(target_key)
+            if loc_info and loc_info.get("type") == "HEAL":
+                print(
+                    "[path] Target HEAL non raggiungibile, provo PokéCenter "
+                    "più vicino come fallback."
+                )
+                path, dirs = self.world.bfs_to_nearest_pokecenter(start_node, blocked=self.blocked_tiles)
+                path_dirs = dirs
+                used_fallback = bool(dirs)
+
+        if not path_dirs:
+            print("[path] Nessun percorso trovato (nemmeno verso PokéCenter vicino), fallback locale (UP).")
+            self.current_path_target_key = None
+            self.current_path_dirs.append("up")
+            return
+
+        print(f"[path] Path con {len(path_dirs)} mosse. Prime 20: {path_dirs[:20]}")
+        self.current_path_dirs = deque(path_dirs)
+        # Target key rimane l'originale (anche se abbiamo usato fallback); è solo informativo
+        self.current_path_target_key = target_key
+        if used_fallback:
+            print("[path] NOTE: in realtà il path va al PokéCenter più vicino, non al target HEAL specifico.")
+
+# =========================
+# MAIN
+# =========================
+
+
+def main():
+    agent = AgentSystem()
+    agent.run()
 
 
 if __name__ == "__main__":
-    AgentSystem().run()
+    main()

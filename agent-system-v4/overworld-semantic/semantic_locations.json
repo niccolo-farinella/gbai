@@ -1,0 +1,111 @@
+{
+  "_comment": "Mappa semantica per early game (Littleroot -> Rustboro).",
+  "locations": {
+    "PLAYER_HOME_BEDROOM": {
+      "desc": "Camera da letto del protagonista a Littleroot.",
+      "map_group": 1,
+      "map_num": 1,
+      "x": 4,
+      "y": 4,
+      "region": "LITTLEROOT",
+      "type": "HOME"
+    },
+    "LITTLEROOT_CENTER": {
+      "desc": "Centro di Littleroot Town (fuori).",
+      "map_group": 0,
+      "map_num": 9,
+      "x": 10,
+      "y": 10,
+      "region": "LITTLEROOT",
+      "type": "TOWN"
+    },
+    "BIRCH_LAB": {
+      "desc": "Laboratorio del Professor Birch a Littleroot.",
+      "map_group": 1,
+      "map_num": 4,
+      "x": 6,
+      "y": 6,
+      "region": "LITTLEROOT",
+      "type": "LAB"
+    },
+    "ROUTE_101_MID": {
+      "desc": "Zona centrale della Route 101.",
+      "map_group": 0,
+      "map_num": 16,
+      "x": 10,
+      "y": 10,
+      "region": "EARLY_GAME",
+      "type": "ROUTE"
+    },
+    "OLDALE_CENTER": {
+      "desc": "Centro di Oldale Town (fuori).",
+      "map_group": 0,
+      "map_num": 10,
+      "x": 10,
+      "y": 10,
+      "region": "EARLY_GAME",
+      "type": "TOWN"
+    },
+    "OLDALE_POKECENTER": {
+      "desc": "Centro Pokémon di Oldale Town.",
+      "map_group": 2,
+      "map_num": 2,
+      "x": 7,
+      "y": 4,
+      "region": "EARLY_GAME",
+      "type": "HEAL"
+    },
+    "ROUTE_102_MID": {
+      "desc": "Zona centrale della Route 102.",
+      "map_group": 0,
+      "map_num": 17,
+      "x": 25,
+      "y": 10,
+      "region": "EARLY_GAME",
+      "type": "ROUTE"
+    },
+    "PETALBURG_POKECENTER": {
+      "desc": "Centro Pokémon di Petalburg City.",
+      "map_group": 8,
+      "map_num": 4,
+      "x": 7,
+      "y": 4,
+      "region": "MID_GAME",
+      "type": "HEAL"
+    },
+    "RUSTBORO_CENTER": {
+      "desc": "Centro di Rustboro City (fuori).",
+      "map_group": 0,
+      "map_num": 3,
+      "x": 20,
+      "y": 30,
+      "region": "EARLY_GAME",
+      "type": "CITY"
+    },
+    "RUSTBORO_POKECENTER": {
+      "desc": "Centro Pokémon di Rustboro City.",
+      "map_group": 11,
+      "map_num": 5,
+      "x": 7,
+      "y": 4,
+      "region": "EARLY_GAME",
+      "type": "HEAL"
+    },
+    "RUSTBORO_GYM": {
+      "desc": "Palestra di Roxanne (tipo Roccia).",
+      "map_group": 11,
+      "map_num": 3,
+      "x": 5,
+      "y": 10,
+      "region": "EARLY_GAME",
+      "type": "GYM"
+    }
+  },
+  "objectives": [
+    "Main goal: finish the game by defeating the Champion and seeing the credits. Always progress the main story when it is safe to do so.",
+    "In the early game, when the team is healthy (average team HP >= 50%), prioritize following this story path: PLAYER_HOME_BEDROOM / BIRCH_LAB / LITTLEROOT_CENTER -> ROUTE_101_MID -> OLDALE_CENTER -> ROUTE_102_MID -> PETALBURG_POKECENTER -> RUSTBORO_CENTER -> RUSTBORO_GYM.",
+    "Heal at nearest HEAL-type location if average team HP < 30%.",
+    "Avoid unnecessary battles when the team is weak; seek trainer battles on ROUTE-type locations when grinding is needed.",
+    "Do not stay idle in towns or cities: if you are already at a TOWN or CITY semantic location and the team is healthy, prefer MOVE towards the next story location instead of WAIT or EXPLORE."
+  ]
+}
