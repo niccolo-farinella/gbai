@@ -172,6 +172,13 @@ class Navigator:
             return (m == dest_map_name) and (x == dx) and (y == dy)
 
         path, dirs = self._bfs_to_target(start, is_goal)
+        if path is None:
+            # impossibile raggiungere il target con i blocchi correnti
+            self.current_dirs = []
+            print("[NAV] plan_to_absolute: nessun path.")
+            return None
+
+        # path trovato; dirs può essere lista vuota se siamo già sul target
         self.current_dirs = dirs or []
         print(f"[NAV] plan_to_absolute: {len(self.current_dirs)} mosse.")
         return self.current_dirs
@@ -273,6 +280,210 @@ class Navigator:
         return False
 
 
+
+# ================= DECISION SCHEMA & FEEDBACK =================
+
+VALID_ACTIONS = {"MOVE", "PRESS", "EXPLORE", "WAIT"}
+VALID_BUTTONS = {None, "A", "B", "START", "SELECT"}
+
+
+def validate_and_fix_decision(decision, valid_targets):
+    """
+    Runtime validator leggero per la decisione del modello.
+    - action fuori schema -> WAIT
+    - se action == "PRESS": target viene ignorato, button sanificato
+    - se action in {"MOVE","EXPLORE","WAIT"}: button viene ignorato
+    - per MOVE: target dev'essere un semantic key valido, altrimenti None
+    Ritorna (decision_corretto, warnings:list[str]).
+    """
+    warnings = []
+    out = {
+        "action": decision.get("action"),
+        "target": decision.get("target"),
+        "button": decision.get("button"),
+        "policy": decision.get("policy") or {},
+    }
+
+    if out["action"] not in VALID_ACTIONS:
+        warnings.append(f"Unknown action '{out['action']}' -> WAIT")
+        out["action"] = "WAIT"
+
+    if out["action"] == "PRESS":
+        if out["button"] not in VALID_BUTTONS or out["button"] is None:
+            warnings.append(f"Invalid button '{out['button']}' -> 'A'")
+            out["button"] = "A"
+        # PRESS non usa target
+        out["target"] = None
+    else:
+        # per MOVE/EXPLORE/WAIT ignoriamo sempre button
+        if out["button"] is not None:
+            warnings.append("Ignoring button for non-PRESS action")
+            out["button"] = None
+        if out["action"] == "MOVE":
+            if out["target"] not in valid_targets:
+                warnings.append(f"Invalid MOVE target '{out['target']}' -> null")
+                out["target"] = None
+
+    # policy defaults
+    pol = out["policy"] or {}
+    if "avoid_optional_trainers" not in pol:
+        pol["avoid_optional_trainers"] = True
+    if "allow_grass_encounters" not in pol:
+        pol["allow_grass_encounters"] = False
+    out["policy"] = pol
+
+    return out, warnings
+
+
+# Percorso storia minimale (early game); può essere esteso senza toccare il resto.
+STORY_PATH = [
+    "PLAYER_HOME_BEDROOM",
+    "BIRCH_LAB",
+    "LITTLEROOT_CENTER",
+    "ROUTE_101_MID",
+    "OLDALE_CENTER",
+    "OLDALE_POKECENTER",
+    "ROUTE_102_MID",
+    "PETALBURG_POKECENTER",
+    "RUSTBORO_CENTER",
+    "RUSTBORO_GYM",
+]
+
+
+class StoryState:
+    def __init__(self):
+        self.index = 0  # indice massimo raggiunto
+
+    def update_on_arrival(self, reached_key: str):
+        if reached_key in STORY_PATH:
+            i = STORY_PATH.index(reached_key)
+            if i > self.index:
+                self.index = i
+
+    def next_target(self):
+        if self.index + 1 < len(STORY_PATH):
+            return STORY_PATH[self.index + 1]
+        return None
+
+
+class FeedbackEngine:
+    """
+    Motore di feedback 'RL-like' puramente simbolico:
+    tiene uno storico locale di decisioni e relativi esiti.
+    """
+
+    def __init__(self, capacity: int = 50):
+        self.buffer = deque(maxlen=capacity)
+
+    @staticmethod
+    def hp_pct(state):
+        try:
+            hp = max(0, int(state["party"].get("hp", 0)))
+            mhp = max(1, int(state["party"].get("max_hp", 1)))
+            return hp / mhp
+        except Exception:
+            return 1.0
+
+    @staticmethod
+    def is_heal_key(key, semantic_dict):
+        if not key:
+            return False
+        info = semantic_dict.get(key, {})
+        return info.get("type") == "HEAL"
+
+    @staticmethod
+    def is_pokecenter_map(world, group, num):
+        try:
+            name = world.map_name_from_group_num(group, num)
+        except Exception:
+            return False
+        if not name:
+            return False
+        return "PokemonCenter_1F" in name
+
+    def evaluate(self, state_before, decision, state_after, semantic_dict, world):
+        """
+        Regole:
+        - OVERWORLD:
+            - se HP% >= 50 e la posizione non cambia (e non è PRESS) -> score -1 ("idle_while_healthy")
+            - se HP% < 30 e il target non è HEAL -> score -1 ("not_healing_while_low_hp")
+        - BATTLE:
+            - unico caso negativo: sconfitta (euristica blackout a PC)
+        Altrimenti score 0.
+        """
+        try:
+            mode_before = state_before.get("mode")
+            mode_after = state_after.get("mode")
+            mb = state_before["map"]
+            ma = state_after["map"]
+            pos_b = (mb["group"], mb["num"], mb["x"], mb["y"])
+            pos_a = (ma["group"], ma["num"], ma["x"], ma["y"])
+        except Exception:
+            return 0, "incomplete_state"
+
+        # BATTLE: unica penalità è sconfitta (blackout al PokéCenter)
+        if mode_before == "BATTLE":
+            if (
+                mode_after == "OVERWORLD"
+                and self.is_pokecenter_map(world, ma["group"], ma["num"])
+            ):
+                return -1, "battle_defeat_blackout"
+            return 0, "battle_progress_or_unknown"
+
+        # OVERWORLD
+        hp_b = self.hp_pct(state_before)
+        action = decision.get("action")
+        target = decision.get("target")
+
+        if hp_b >= 0.50 and pos_b == pos_a and action != "PRESS":
+            return -1, "idle_while_healthy"
+
+        if hp_b < 0.30:
+            if not self.is_heal_key(target, semantic_dict):
+                return -1, "not_healing_while_low_hp"
+
+        return 0, "neutral"
+
+    def push(self, state_before, decision, state_after, semantic_dict, world):
+        score, reason = self.evaluate(
+            state_before, decision, state_after, semantic_dict, world
+        )
+        item = {
+            "ts": time.time(),
+            "decision": decision,
+            "score": score,
+            "reason": reason,
+            "before": {
+                "mode": state_before.get("mode"),
+                "pos": state_before.get("map"),
+                "hp": state_before.get("party"),
+            },
+            "after": {
+                "mode": state_after.get("mode"),
+                "pos": state_after.get("map"),
+                "hp": state_after.get("party"),
+            },
+        }
+        self.buffer.append(item)
+        return item
+
+
+def build_last_action_summary(feedback_engine):
+    if not feedback_engine or not feedback_engine.buffer:
+        return "No previous decision."
+    last = feedback_engine.buffer[-1]
+    d = last["decision"]
+    b = last["before"]["pos"]
+    a = last["after"]["pos"]
+    return (
+        f"Previous decision: {d.get('action')} -> "
+        f"target={d.get('target')} button={d.get('button')}. "
+        f"Result: {last['reason']} (score={last['score']}). "
+        f"Was at map=({b['group']},{b['num']})@({b['x']},{b['y']}); "
+        f"now at map=({a['group']},{a['num']})@({a['x']},{a['y']})."
+    )
+
+
 # ================= GAME BRAIN (LLM) =================
 
 class GameBrain:
@@ -356,7 +567,7 @@ class GameBrain:
 
     # ------- chiamata LLM -------
 
-    def ask_ollama(self, state):
+    def ask_ollama(self, state, last_action_summary=None, story_next_target=None):
         mode = state.get("mode", "OVERWORLD")
         now = time.time()
 
@@ -404,13 +615,26 @@ class GameBrain:
             '}'
         )
 
+        las = last_action_summary or "No previous decision."
+        story_line = (
+            f"- Next main story target: {story_next_target}"
+            if story_next_target
+            else "- Next main story target: (none / free-roam)"
+        )
+
         prompt = f"""You are an AI playing Pokémon Emerald. You control only HIGH-LEVEL decisions.
+
+LAST ACTION SUMMARY:
+- {las}
 
 CURRENT STATE:
 - Map position: group={g}, num={n}, x={x}, y={y}
 - Nearest semantic location key: {loc_key}
 - Mode: {state['mode']}
 - Active Pokémon HP: {hp}/{mhp} (~{hp_pct}%)
+
+STORY PROGRESSION:
+{story_line}
 
 WORLD KNOWLEDGE:
 - Semantic locations (keys and metadata): {json.dumps(loc_summaries, ensure_ascii=False)}
@@ -490,6 +714,12 @@ class AgentSystem:
         self.world = World(WORLD_FILE)
         self.navigator = Navigator(self.world)
         self.brain = GameBrain(SEMANTIC_FILE, self.world, METADATA_FILE)
+
+        # stato "alto livello" per storia e feedback
+        self.story_state = StoryState()
+        self.feedback_engine = FeedbackEngine()
+        self.last_state_before_decision = None
+        self.last_decision = None
 
         self.latest_state = None
         self.current_target = None  # chiave semantic_location
@@ -572,9 +802,30 @@ class AgentSystem:
 
             st = self.latest_state
 
+            # feedback sulla decisione precedente, se disponibile
+            if self.last_decision is not None and self.last_state_before_decision is not None:
+                semantic_dict = self.brain.knowledge.get("locations", {})
+                fb_item = self.feedback_engine.push(
+                    self.last_state_before_decision,
+                    self.last_decision,
+                    st,
+                    semantic_dict,
+                    self.world,
+                )
+                print(f"[FEEDBACK] score={fb_item['score']} reason={fb_item['reason']}")
+                self.last_decision = None
+                self.last_state_before_decision = None
+
+            last_action_summary = build_last_action_summary(self.feedback_engine)
+            story_next_target = self.story_state.next_target()
+
             # ================= BATTLE =================
             if st["mode"] == "BATTLE":
-                decision_json = self.brain.ask_ollama(st)
+                decision_json = self.brain.ask_ollama(
+                    st,
+                    last_action_summary=last_action_summary,
+                    story_next_target=story_next_target,
+                )
                 if decision_json:
                     self._handle_decision(decision_json, battle_mode=True)
                 else:
@@ -597,7 +848,11 @@ class AgentSystem:
                 continue
 
             # 2) nessun path attivo -> chiediamo al LLM un nuovo obiettivo
-            decision_json = self.brain.ask_ollama(st)
+            decision_json = self.brain.ask_ollama(
+                st,
+                last_action_summary=last_action_summary,
+                story_next_target=story_next_target,
+            )
             if decision_json:
                 self._handle_decision(decision_json, battle_mode=False)
             else:
@@ -610,10 +865,17 @@ class AgentSystem:
 
     def _handle_decision(self, decision_json, battle_mode: bool):
         try:
-            dec = json.loads(decision_json) if isinstance(decision_json, str) else decision_json
+            dec_raw = json.loads(decision_json) if isinstance(decision_json, str) else decision_json
         except Exception as e:
             print(f"[ERR] parsing decision_json: {e}")
             return
+
+        # validazione runtime dello schema decisionale
+        valid_targets = list(self.brain.knowledge.get("locations", {}).keys())
+        dec, warnings = validate_and_fix_decision(dec_raw, valid_targets)
+        if warnings:
+            for w in warnings:
+                print(f"[SCHEMA] {w}")
 
         print(f"[LLM] decision: {dec}")
 
@@ -623,14 +885,16 @@ class AgentSystem:
         allow_grass = bool(policy.get("allow_grass_encounters", True))
         _ = (avoid_opt, allow_grass)  # placeholder per futuri usi
 
-        # 1) bottoni immediati
+        action = dec.get("action")
         btn = dec.get("button")
-        if btn in ["A", "B", "START", "SELECT"]:
+
+        # 1) azioni PRESS (bottoni immediati)
+        if action == "PRESS":
+            if btn not in ["A", "B", "START", "SELECT"]:
+                btn = "A"
             print(f"[ACT] Press {btn}")
             self.send_input(btn, self.default_hold_frames)
             return
-
-        action = dec.get("action")
 
         if battle_mode:
             # In battle ignoriamo MOVE / EXPLORE / WAIT
@@ -666,9 +930,13 @@ class AgentSystem:
                 return
 
             dirs = self.navigator.plan_to_absolute(start_map_name, sx, sy, map_name, tx, ty)
-            if not dirs:
+            if dirs is None:
                 print("[NAV] Nessun path valido verso il target, annullo target.")
                 self.current_target = None
+            elif len(dirs) == 0:
+                print("[NAV] Nessun movimento necessario: già sul target.")
+                # aggiorna progressione storia in base al target raggiunto
+                self.story_state.update_on_arrival(target_key)
 
         elif action == "EXPLORE":
             # semplice passo random
@@ -706,9 +974,13 @@ class AgentSystem:
 
         print("[NAV] ricalcolo path per collisione dinamica.")
         dirs = self.navigator.plan_to_absolute(start_map_name, sx, sy, map_name, tx, ty)
-        if not dirs:
+        if dirs is None:
             print("[NAV] Nessun path valido verso il target corrente, annullo target.")
             self.current_target = None
+            self.navigator.clear_path()
+        elif len(dirs) == 0:
+            print("[NAV] Già sul target corrente dopo il ricalcolo; nessuna mossa necessaria.")
+            self.story_state.update_on_arrival(self.current_target)
             self.navigator.clear_path()
 
 

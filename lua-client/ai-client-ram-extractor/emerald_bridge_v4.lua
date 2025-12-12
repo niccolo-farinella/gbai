@@ -15,7 +15,7 @@ local FRAME_INTERVAL = 20
 
 -- Indirizzi noti per Pokémon Emerald (U)
 local ADDR_SAVE1_PTR    = 0x03005D8C  -- pointer a SaveBlock1
-local ADDR_BATTLE_FLAGS = 0x02022B4C  -- battle flags (!=0 -> in battaglia)
+local ADDR_BATTLE_FLAGS  = 0x02022FEC  -- battle flags (!=0 -> in battaglia)
 local ADDR_PARTY_PTR    = 0x020244EC  -- primo Pokémon in party
 
 ---------------------------------------
