@@ -47,8 +47,7 @@ def _first_existing(candidates: List[Path]) -> Path:
 
 
 OVERWORLD_NAV_JSON = _first_existing([
-    BASE_DIR / "overworld_nav.json",
-    BASE_DIR / "overworld-json" / "overworld_nav.json",
+    BASE_DIR / "overworld-json" / "overworld_nav_patched.json",
 ])
 
 OVERWORLD_META_JSON = _first_existing([
@@ -623,6 +622,16 @@ class AgentSystemV5:
         self.consecutive_no_progress = 0
 
         self.semantic_compact = sorted(self.world.semantic_summary_compact(), key=lambda d: d["key"])
+        # cache: warp tiles per map (treat as walkable for pathfinding)
+        self._warp_tiles_cache: Dict[str, set] = {}
+
+        # HEAL interaction state (Pokecenter nurse).
+        # When a HEAL semantic goal is reached, the agent must press A to talk to the nurse
+        # and advance dialog until HP is restored (hp_ratio ~ 1.0).
+        self.heal_active: bool = False
+        self.heal_goal_key: Optional[str] = None
+        self.last_heal_press_time: float = 0.0
+
         self.readme_text = _try_load_text(README_CONTEXT_CANDIDATES) or ""
 
     def bootstrap_models(self):
@@ -667,17 +676,23 @@ class AgentSystemV5:
             if st.mode == "BATTLE":
                 self._handle_battle(st)
                 continue
-
-            # Goal reached
-            if self.current_goal and self._is_goal_reached(st, self.current_goal):
-                print(f"[goal] Reached {self.current_goal}. Clearing goal/plan.")
-                self.current_goal = None
-                self.plan_queue.clear()
-
             # Textbox is a hard stop.
             if st.textbox_open:
                 self._handle_textbox(st)
                 continue
+
+            # Goal reached (HEAL goals may require nurse interaction).
+            if self.current_goal and self._is_goal_reached(st, self.current_goal):
+                should_clear = self._handle_reached_goal(st, self.current_goal)
+                if should_clear:
+                    print(f"[goal] Reached {self.current_goal}. Clearing goal/plan.")
+                    self.current_goal = None
+                    self.plan_queue.clear()
+                else:
+                    # HEAL interaction queued input(s) or is throttled; avoid replanning to an empty path.
+                    if self.plan_queue and st.frame >= self.input_busy_until_frame:
+                        self._execute_next_plan_step(st)
+                    continue
 
             # Execute plan if ready
             if self.plan_queue and st.frame >= self.input_busy_until_frame:
@@ -700,10 +715,8 @@ class AgentSystemV5:
                 self._query_strategist_for_goal(st)
                 # fallthrough: if Strategist set a goal, let next loop handle nav/plan
                 continue
-
-            # Soft menu recovery only when idle.
-            if (not self.plan_queue) and st.menu_open:
-                self._try_close_menu_soft(st)
+            # NOTE: st.menu_open is unreliable with the current Lua UI addresses;
+            # do not spam B based on it. UI recovery is handled via textbox handling and STUCK recovery.
 
     # ---------- logging ----------
 
@@ -764,8 +777,16 @@ class AgentSystemV5:
 
         dec = StrategistDecision.parse(txt)
         print(f"[STRATEGIST] {dec} (lat={t1 - t0:.2f}s)")
-
         if dec.intent == "GO_TO" and dec.goal:
+            # If we're already at the requested target, avoid calling Navigator for an empty plan.
+            if self._is_goal_reached(st, dec.goal):
+                self.current_goal = dec.goal
+                self.current_policy = self._normalize_policy(dec.policy)
+                self.plan_queue.clear()
+                if self._handle_reached_goal(st, dec.goal):
+                    self.current_goal = None
+                return
+
             changed = (dec.goal != self.current_goal)
             self.current_goal = dec.goal
             self.current_policy = self._normalize_policy(dec.policy)
@@ -814,6 +835,12 @@ class AgentSystemV5:
                 subgoal = {"kind": "map_route_unknown", "hint": "No known path; explore edges and look for exits/warps."}
 
         buttons = self._python_build_plan(st, cur_map_name, subgoal, event=event)
+
+        # On repeated movement failures, try interacting (A) once before continuing movement.
+        if event and str(event.get("type")) == "STUCK":
+            buttons = [("A", DEFAULT_BUTTON_HOLD_FRAMES)] + (buttons or [])
+            buttons = buttons[:MAX_PLAN_BUTTONS]
+
         self.last_nav_time = time.time()  # end-ish timestamp (cheap, but consistent)
 
         if buttons:
@@ -834,6 +861,12 @@ class AgentSystemV5:
         tx = int(subgoal.get("x", sx))
         ty = int(subgoal.get("y", sy))
 
+        # Allow stepping onto door tiles that are warps (these are often marked non-walkable in the exported grid)
+        extra_walkable = set()
+        if subgoal.get("kind") == "warp":
+            extra_walkable |= self._warp_tiles(map_name)
+            extra_walkable.add((tx, ty))
+
         blocked = set()
         if bool(self.current_policy.get("avoid_optional_trainers", True)):
             blocked |= self._trainer_avoid_tiles(map_name, radius=1)
@@ -843,7 +876,7 @@ class AgentSystemV5:
             if shim:
                 return shim
 
-        path_dirs = self._python_path_dirs(grid, sx, sy, tx, ty, blocked=blocked)
+        path_dirs = self._python_path_dirs(grid, sx, sy, tx, ty, blocked=blocked, extra_walkable=extra_walkable)
         if path_dirs is None:
             return self._python_fallback_explore(st, map_name, target=(tx, ty), blocked=blocked)
 
@@ -875,6 +908,26 @@ class AgentSystemV5:
                         out.add((x + dx, y + dy))
         return out
 
+
+    def _warp_tiles(self, map_name: str):
+        # Many outdoor maps mark building/door tiles as non-walkable in the exported collision grid,
+        # even though stepping onto them triggers a warp. Treat all warp_event coordinates as walkable
+        # for pathfinding targets and detours.
+        cached = self._warp_tiles_cache.get(map_name)
+        if cached is not None:
+            return cached
+
+        mp = self.world.maps.get(map_name) or {}
+        out = set()
+        for w in (mp.get("warp_events") or []):
+            try:
+                out.add((int(w.get("x")), int(w.get("y"))))
+            except Exception:
+                continue
+
+        self._warp_tiles_cache[map_name] = out
+        return out
+
     def _python_stuck_shim(self, st: GameState, map_name: str, blocked: set):
         mp = self.world.maps.get(map_name) or {}
         grid = mp.get("grid")
@@ -902,7 +955,7 @@ class AgentSystemV5:
         except Exception:
             return False
 
-    def _python_path_dirs(self, grid, sx: int, sy: int, tx: int, ty: int, blocked: set):
+    def _python_path_dirs(self, grid, sx: int, sy: int, tx: int, ty: int, blocked: set, extra_walkable: Optional[set] = None):
         if (sx, sy) == (tx, ty):
             return []
 
@@ -914,6 +967,7 @@ class AgentSystemV5:
 
         start = (sx, sy)
         goal = (tx, ty)
+        extra_walkable = extra_walkable or set()
 
         q = deque([start])
         prev = {start: None}
@@ -931,7 +985,7 @@ class AgentSystemV5:
                     continue
                 if (nx, ny) in blocked and (nx, ny) != goal:
                     continue
-                if not self._grid_walkable(grid, nx, ny):
+                if not self._grid_walkable(grid, nx, ny) and (nx, ny) not in extra_walkable and (nx, ny) != goal:
                     continue
                 prev[(nx, ny)] = (x, y)
                 prev_dir[(nx, ny)] = b
@@ -1119,6 +1173,40 @@ class AgentSystemV5:
         if "allow_grass_encounters" in policy:
             out["allow_grass_encounters"] = bool(policy.get("allow_grass_encounters"))
         return out
+
+    def _handle_reached_goal(self, st: GameState, goal_key: str) -> bool:
+        """Return True if the goal can be cleared, False if we must keep working (e.g., healing)."""
+        tgt = self.world.semantic_target(goal_key)
+        if not tgt:
+            return True
+
+        if str(tgt.get("type", "")).upper() != "HEAL":
+            # No special interaction required.
+            self.heal_active = False
+            self.heal_goal_key = None
+            return True
+
+        # For HEAL goals, consider the goal complete only when HP is (near) full.
+        if st.hp_ratio >= 0.98:
+            self.heal_active = False
+            self.heal_goal_key = None
+            return True
+
+        self.heal_active = True
+        self.heal_goal_key = goal_key
+
+        # UI flags can be flaky; just attempt to talk/advance periodically.
+        now = time.time()
+        if (now - self.last_heal_press_time) >= 0.8 and st.frame >= self.input_busy_until_frame:
+            self.last_heal_press_time = now
+            # Press A a few times; textbox handling will take over if the flag is reliable.
+            seq = [("A", DEFAULT_BUTTON_HOLD_FRAMES)] * 3
+            if self.plan_queue:
+                self.plan_queue = deque(seq + list(self.plan_queue))
+            else:
+                self.plan_queue = deque(seq)
+
+        return False
 
     def _is_goal_reached(self, st: GameState, goal_key: str) -> bool:
         tgt = self.world.semantic_target(goal_key)

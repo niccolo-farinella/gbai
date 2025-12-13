@@ -55,3 +55,13 @@ This project’s early-game objectives typically follow:
 `PLAYER_HOME_BEDROOM` → `BIRCH_LAB` → `LITTLEROOT_CENTER` → `ROUTE_101_MID` → `OLDALE_CENTER` → `ROUTE_102_MID` → `PETALBURG_POKECENTER` → `RUSTBORO_CENTER` → `RUSTBORO_GYM`.
 
 (Exact keys available depend on the runtime `known_semantic_locations` list.)
+
+## PokéCenter healing procedure (important)
+When you decide to heal at a **HEAL** semantic location (Pokémon Center):
+- The coordinate for the HEAL location is the *tile in front of the nurse counter*.
+- If you are already at that coordinate and `hp_pct < 1.0`, do **not** output GO_TO again.
+  Instead output `action="PRESS"`, `button="A"` (repeat 1–3).
+- Continue pressing **A** until the dialog is fully exhausted (healing completes).
+- After healing (HP restored), immediately continue story progression by selecting the next semantic goal.
+  The Navigator will handle exiting the building via the door warp as part of the movement plan.
+
