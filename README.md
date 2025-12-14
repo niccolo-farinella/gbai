@@ -1,16 +1,16 @@
-# gbAI — Pokémon Emerald AI Player (Agent System v4)
+# gbAI — Pokémon Emerald AI Player (Agent System v6)
 
 ## Overview
 This project runs Pokémon Emerald in **mGBA** with a **Lua bridge** that:
 1) streams game state snapshots to a Python backend over TCP, and
 2) receives controller input commands back from Python and applies them in-game.
 
-The Python backend (`ai_player_v4.py` / `ai_player_v4_correct_fix.py`) orchestrates **two Ollama models**:
+The Python backend (`ai_player_v6.py`) orchestrates **two Ollama models**:
 - **Strategist**: decides *WHAT* to do next (goal selection, dialog, battle stance).
 - **Navigator**: decides *HOW* to move in the overworld by outputting a short micro‑plan of controller inputs.
 
 ## Architecture (data flow)
-1) `emerald_bridge_v5.lua` sends a JSON line every `FRAME_INTERVAL` frames with:
+1) `emerald_bridge_v7.lua` sends a JSON line every `FRAME_INTERVAL` frames with:
     - `frame`, `mode` (OVERWORLD/BATTLE), `ui` flags, `map` (group/num/x/y), and `party` HP.
 2) Python reads snapshots, routes control by mode/UI flags, and asks:
     - Strategist for a high-level decision (goal/dialog/battle).
@@ -20,7 +20,7 @@ The Python backend (`ai_player_v4.py` / `ai_player_v4_correct_fix.py`) orchestra
 
 ## Model output schemas (must be JSON-only)
 ### Strategist output schema
-See `Strategist.json` and `Modelfile-strategist.txt`.
+See `ollama/model-injection/Strategist.json` and `ollama/model-injection/Modelfile.strategist`.
 
 ```json
 {
@@ -49,36 +49,28 @@ Navigator returns a short list of input tuples `["BUTTON", FRAMES]` (max 12).
 
 ## World data
 The backend loads:
-- `semantic_locations.json` (authoritative list of valid GO_TO goals for Strategist).
-- `overworld_nav.json` and `overworld_metadata.json` (navigation graph + map metadata).
-
-Notes:
-- In `ai_player_v4.py`, Navigator can be bootstrapped with the full overworld data (chunked) and cached via Ollama context.
-- In `ai_player_v4_correct_fix.py`, Navigator uses a **light bootstrap** and receives only local/world windows at runtime (lower bootstrap cost).
+- `overworld-semantic/semantic_locations.json` (authoritative list of valid GO_TO goals for Strategist).
+- `overworld-json/overworld_nav_patched.json` and `overworld-json/overworld_metadata.json` (navigation graph + map metadata).
 
 ## Setup
 ### 1) Build Ollama models
 Create the two models from Modelfiles:
-- `gbai-strategist` (from `Modelfile-strategist.txt`).
-- `gbai-navigator` (from `Modelfile-navigator.txt`).
+- `gbai-strategist` (from `ollama/model-injection/Modelfile.strategist`).
 
 Example (paths may differ):
 ```bash
-ollama create gbai-strategist -f Modelfile-strategist.txt
-ollama create gbai-navigator  -f Modelfile-navigator.txt
+ollama create gbai-strategist -f ollama/model-injection/Modelfile.strategist
 ```
 
 ### 2) Run mGBA + Lua bridge
 1) Open Pokémon Emerald (U) ROM in mGBA.
-2) Load the Lua script `emerald_bridge_v5.lua`.
+2) Load the Lua script `emerald_bridge_v7.lua`.
 3) Ensure the Lua script is configured for the same host/port as Python (default `127.0.0.1:8765`).
 
 ### 3) Run the backend
 From the backend folder:
 ```bash
-python ai_player_v5.py
-# or
-python ai_player_v4.py
+python ai_player_v6.py
 ```
 
 Environment variables (optional) are supported in the backend:
@@ -94,7 +86,6 @@ Symptoms:
 Actions:
 - Increase `LLM_TIMEOUT_SECONDS` (e.g. 120–180) in environment variables.
 - Ensure the model is warmed up (first request can be slow).
-- Prefer the “light bootstrap” variant (`ai_player_v4_correct_fix.py`) to avoid chunking huge JSON into context.
 
 ### B) Strategist logs appear, but the game does not move (no inputs applied)
 The Lua bridge applies inputs only when it receives lines `KEY:FRAMES` and parses them.

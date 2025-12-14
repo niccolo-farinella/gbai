@@ -8,16 +8,14 @@
 -- IMPORTANT (mGBA stability):
 --   Do not run a top-level busy loop. Use callbacks instead.
 
-local BRIDGE_VERSION = "emerald_bridge_v6.3"
-
--- ============================================================
+local BRIDGE_VERSION = "emerald_bridge_v7"-- ============================================================
 -- Logging
 -- ============================================================
 -- In mGBA, `print()` output isn't always obvious depending on which scripting
 -- UI panel is open. A TextBuffer is reliably visible under Tools -> Scripting.
 local logbuf = nil
 if console and console.createBuffer then
-  logbuf = console:createBuffer("AI Bridge v6")
+  logbuf = console:createBuffer("AI Bridge v7")
   pcall(function() logbuf:setSize(90, 12) end)
 end
 
@@ -35,7 +33,7 @@ local HOST = "127.0.0.1"
 local PORT = 8765
 
 -- Runtime throttles
-local SEND_EVERY_N_FRAMES = 1
+local SEND_EVERY_N_FRAMES = 3
 local CONNECT_RETRY_EVERY_N_FRAMES = 60
 
 -- Debugging (keep OFF by default; printing every frame will lag)
@@ -156,11 +154,14 @@ local KEY_MASK = build_key_masks()
 -- Game addresses (vanilla Emerald (U) / BPEE)
 -- ============================================================
 -- NOTE: These are the minimum required by ai_player_v6.py today.
--- UI flags remain intentionally conservative (0) until we standardize their mapping.
+-- UI flags are heuristics based on gScriptContext2_Enabled and gMain.callback2.
 
 local ADDR_SAVE_BLOCK_1_PTR   = 0x03005D8C  -- gSaveBlock1Ptr
 local ADDR_BATTLE_TYPE_FLAGS  = 0x02022FEC  -- gBattleTypeFlags (nonzero => battle-ish)
 
+-- UI / engine state (BPEE / Emerald (U))
+local ADDR_SCRIPT_CTX2_ENABLED = 0x03000DF4  -- gScriptContext2_Enabled (u8; 1 => player locked by script/text)
+local ADDR_GMAIN_CB2           = 0x030022C4  -- gMain.callback2 (u32 function ptr; used as battle/menu discriminator)
 -- SaveBlock1 layout (field)
 local SB1_PLAYER_X   = 0x0000 -- u16
 local SB1_PLAYER_Y   = 0x0002 -- u16
@@ -180,6 +181,35 @@ local MON_MAX_HP_OFFSET = 0x58
 local function u8(addr)  return emu:read8(addr)  end
 local function u16(addr) return emu:read16(addr) end
 local function u32(addr) return emu:read32(addr) end
+
+-- ============================================================
+-- ROM identity (sanity check)
+-- ============================================================
+-- This bridge hardcodes addresses for vanilla Emerald (U) / BPEE.
+-- If you load a different ROM (v1.1, other region, hack), reads may be wrong.
+local function read_game_code()
+  local base = 0x080000AC -- ROM header game code (4 ASCII chars)
+  local t = {}
+  for i = 0, 3 do
+    local b = u8(base + i)
+    t[#t + 1] = string.char(b or 0)
+  end
+  return table.concat(t)
+end
+
+local GAME_CODE = nil
+do
+  local ok, code = pcall(read_game_code)
+  if ok then
+    GAME_CODE = code
+  end
+  if GAME_CODE and GAME_CODE ~= "BPEE" then
+    slog("WARNING: ROM game code is '" .. tostring(GAME_CODE) .. "' (expected 'BPEE'). Address mapping may be wrong.")
+  else
+    slog("ROM game code: " .. tostring(GAME_CODE or "unknown"))
+  end
+end
+
 
 -- ============================================================
 -- Snapshot building
@@ -220,10 +250,99 @@ local function sum_party_hp(party_base)
   return hp_sum, max_sum
 end
 
-local function in_battle()
-  local flags = u32(ADDR_BATTLE_TYPE_FLAGS)
-  return flags and flags ~= 0
+
+-- ============================================================
+-- Mode / UI heuristics
+-- ============================================================
+-- IMPORTANT: gBattleTypeFlags is not reliably cleared immediately after a battle.
+-- To avoid getting stuck in "BATTLE" forever, we combine it with gMain.callback2:
+--   - we learn a baseline callback2 pointer for the overworld ("free control")
+--   - we treat "battle active" only when battle flags are set AND callback2 differs
+--   - we add a small hysteresis window to smooth transitions/fades
+local OVERWORLD_CB2 = nil
+local battle_latched = false
+local battle_exit_grace = 0
+local BATTLE_EXIT_GRACE_FRAMES = 20
+
+local function safe_read_u8(addr)
+  local ok, v = pcall(function() return emu:read8(addr) end)
+  if ok then return v end
+  return nil
 end
+
+local function safe_read_u32(addr)
+  local ok, v = pcall(function() return emu:read32(addr) end)
+  if ok then return v end
+  return nil
+end
+
+local function ptr_in_rom(p)
+  return type(p) == "number" and p >= 0x08000000 and p < 0x0A000000
+end
+
+local function compute_mode_and_ui()
+  local flags = safe_read_u32(ADDR_BATTLE_TYPE_FLAGS) or 0
+  local script2 = safe_read_u8(ADDR_SCRIPT_CTX2_ENABLED) or 0
+  local cb2 = safe_read_u32(ADDR_GMAIN_CB2)
+
+  local cb2_valid = ptr_in_rom(cb2)
+
+  -- Learn the overworld callback2 value when we are confidently free in the field.
+  if flags == 0 and script2 == 0 and cb2_valid then
+    OVERWORLD_CB2 = cb2
+  end
+
+  local cb2_diff = (OVERWORLD_CB2 ~= nil and cb2_valid and cb2 ~= OVERWORLD_CB2) or false
+
+  -- Battle detection:
+  -- - If flags are set but callback2 == overworld baseline, treat as stale leftover.
+  -- - If we don't yet know the baseline (early boot), fall back to flags.
+  local battle_instant = false
+  if flags ~= 0 then
+    battle_instant = (OVERWORLD_CB2 == nil) and true or cb2_diff
+  end
+
+  if battle_instant then
+    battle_latched = true
+    battle_exit_grace = BATTLE_EXIT_GRACE_FRAMES
+  elseif battle_latched then
+    if battle_exit_grace > 0 then
+      battle_exit_grace = battle_exit_grace - 1
+    else
+      battle_latched = false
+    end
+  end
+
+  local in_battle_now = battle_latched
+
+  -- UI flags:
+  -- script2 == 1 typically means a script/textbox is running and the player is locked.
+  local textbox_open = (script2 == 1) and 1 or 0
+  -- If callback2 differs from the overworld baseline (and we're not in battle),
+  -- assume a menu / special callback is active (start menu, bag, etc.).
+  local menu_open = (not in_battle_now and cb2_diff and script2 == 0) and 1 or 0
+  local control_enabled = (in_battle_now or textbox_open == 1 or menu_open == 1) and 0 or 1
+
+  if DEBUG then
+    dlog(string.format("mode=%s flags=0x%08X script2=%d cb2=0x%08X ow=0x%08X diff=%s",
+      in_battle_now and "BATTLE" or "OVERWORLD",
+      flags,
+      script2,
+      cb2 or 0,
+      OVERWORLD_CB2 or 0,
+      tostring(cb2_diff)
+    ))
+  end
+
+  return in_battle_now, textbox_open, menu_open, control_enabled
+end
+
+-- Back-compat helper (avoid scattering compute calls throughout the code)
+local function in_battle()
+  local b = select(1, compute_mode_and_ui())
+  return b
+end
+
 
 local function json_escape(s)
   s = tostring(s)
@@ -236,14 +355,11 @@ local function json_escape(s)
 end
 
 local function make_snapshot(frame)
-  local mode = in_battle() and "BATTLE" or "OVERWORLD"
+  local in_battle_now, textbox_open, menu_open, control_enabled = compute_mode_and_ui()
+  local mode = in_battle_now and "BATTLE" or "OVERWORLD"
   local map_group, map_num, px, py = read_position()
   local php, pmax = sum_party_hp(ADDR_PLAYER_PARTY)
 
-  -- UI flags: keep conservative defaults until we add stable symbol-based reads.
-  local textbox_open = 0
-  local menu_open = 0
-  local control_enabled = 1
 
   return string.format(
     '{"frame":%d,' ..
@@ -274,6 +390,7 @@ local cmd_queue = {}
 
 -- RX buffering (mGBA socket API reads raw bytes, not lines)
 local rx_buf = ""
+local MAX_RX_BUF = 8192
 
 local function close_socket()
   if sock then
@@ -383,6 +500,10 @@ local function poll_commands()
   end
 
   rx_buf = rx_buf .. data
+  if #rx_buf > MAX_RX_BUF then
+    dlog("RX buffer overflow (" .. tostring(#rx_buf) .. " bytes); dropping buffer.")
+    rx_buf = ""
+  end
 
   while true do
     local nl = rx_buf:find("\n", 1, true)

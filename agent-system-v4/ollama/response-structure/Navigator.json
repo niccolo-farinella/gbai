@@ -1,6 +1,0 @@
-{
-  "intent": "PLAN | STEP | WAIT | RECOVER",
-  "buttons": [["UP",15], ["RIGHT",15]],
-  "confidence": 0.0,
-  "note": "optional short note"
-}
