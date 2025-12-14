@@ -74,8 +74,8 @@ DEFAULT_BUTTON_HOLD_FRAMES = 4
 # Ollama (Strategist only)
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "127.0.0.1")
 OLLAMA_PORT = int(os.environ.get("OLLAMA_PORT", "11434"))
-OLLAMA_MODEL_INSTRUCT = os.environ.get("OLLAMA_MODEL_INSTRUCT", "llama3.2:3b-instruct-q8_0")
-OLLAMA_MODEL_STRAT = os.environ.get("OLLAMA_MODEL_STRAT", "gbai-strategist")
+OLLAMA_MODEL_INSTRUCT = os.environ.get("OLLAMA_MODEL_INSTRUCT", "llama3.1:8b-instruct-q4_0")
+OLLAMA_MODEL_STRAT = os.environ.get("OLLAMA_MODEL_STRAT", "gbai-strategist-65k:latest")
 LLM_TIMEOUT_SECONDS = int(os.environ.get("LLM_TIMEOUT_SECONDS", "180"))
 
 # Cooldowns (seconds)
@@ -732,7 +732,7 @@ class AgentSystemV5:
         
         # 2. Chiama Ollama (stateless, context=[])
         try:
-            raw_response, _ = self.ollama.generate(OLLAMA_MODEL_STRAT, prompt, context=[])
+            raw_response, _ = self.ollama.generate(OLLAMA_MODEL_INSTRUCT, prompt, context=[])
         except Exception as e:
             print(f"[SUPERVISOR] Errore Ollama: {e}")
             return
@@ -801,7 +801,7 @@ class AgentSystemV5:
             st.map_name = self.world.map_name_for(st.map_group, st.map_num)
 
         prev_frame = st.frame
-        print("[agent] Starting main loop (v5 + API).")
+        print("[agent] Starting main loop (v5 + API + BattleFix).")
         self.bootstrap_models()
 
         while True:
@@ -1414,3 +1414,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
